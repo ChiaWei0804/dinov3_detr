@@ -26,7 +26,10 @@ def load_dinov3_backbone(weights_path='weights/dinov3_vitb16_pretrain_lvd1689m-7
         backbone: Loaded DINOv3 backbone model
     """
     if repo_dir is None:
-        repo_dir = os.getcwd()
+        # hubconf.py and the default relative weights path both sit beside this
+        # module, so anchor to it. Falling back to os.getcwd() made the loader
+        # work only when the caller happened to be in the project root.
+        repo_dir = os.path.dirname(os.path.abspath(__file__))
     
     print(f"Repo directory: {repo_dir}")
     
@@ -55,7 +58,7 @@ def load_dinov3_backbone(weights_path='weights/dinov3_vitb16_pretrain_lvd1689m-7
 
 
 def load_detection_model(model_path, device=None, weights_path='weights/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth',
-                        num_queries=100, verbose=True):
+                        num_queries=100, verbose=True, allow_partial=False):
     """
     Load detection model from checkpoint.
     
@@ -116,7 +119,15 @@ def load_detection_model(model_path, device=None, weights_path='weights/dinov3_v
     # Load weights (support both new and old checkpoint formats)
     if verbose:
         print(f"\nLoad model weights...")
-    
+
+    # Components whose weights could not be loaded. Every branch below used to
+    # print a warning (only when verbose) and carry on, so an old checkpoint
+    # produced a model with a randomly initialised encoder, decoder or bbox head
+    # while the function still reported success - and evaluation then measured
+    # untrained weights. Collected here and turned into a hard error unless the
+    # caller explicitly asks for partial loading.
+    skipped = []
+
     try:
         model.patch_proj.load_state_dict(checkpoint['patch_proj'])
         model.cls_proj.load_state_dict(checkpoint['cls_proj'])
@@ -131,16 +142,17 @@ def load_detection_model(model_path, device=None, weights_path='weights/dinov3_v
                 print("Loaded Transformer Encoder weights (new format)")
         elif 'encoder_self_attns' in checkpoint:
             # Old format: separate components (backward compatibility)
-            if verbose:
-                print("Warning: Old checkpoint format detected. Encoder weights may not load correctly.")
-                print("Please retrain with new format or convert checkpoint.")
-                print("Skipping old format encoder weights (architecture mismatch)")
-        
+            skipped.append('encoder (old encoder_self_attns format)')
+        else:
+            skipped.append('encoder (no encoder key in checkpoint)')
+
         # Load TopK score head
         if 'topk_score_head' in checkpoint:
             model.topk_score_head.load_state_dict(checkpoint['topk_score_head'])
             if verbose:
                 print("Loaded TopK score head weights")
+        else:
+            skipped.append('topk_score_head')
         
         # Load Decoder weights (support both new and old format)
         if 'decoder' in checkpoint:
@@ -150,10 +162,9 @@ def load_detection_model(model_path, device=None, weights_path='weights/dinov3_v
                 print("Loaded Transformer Decoder weights (new format)")
         elif 'decoder_self_attns' in checkpoint:
             # Old format: separate components (backward compatibility)
-            if verbose:
-                print("Warning: Old checkpoint format detected. Decoder weights may not load correctly.")
-                print("Please retrain with new format or convert checkpoint.")
-                print("Skipping old format decoder weights (architecture mismatch)")
+            skipped.append('decoder (old decoder_self_attns format)')
+        else:
+            skipped.append('decoder (no decoder key in checkpoint)')
         
         # Load detection heads
         model.cls_head.load_state_dict(checkpoint['cls_head'])
@@ -164,11 +175,7 @@ def load_detection_model(model_path, device=None, weights_path='weights/dinov3_v
         if 'weight' in bbox_head_state and 'bias' in bbox_head_state:
             # Old format: single Linear layer with keys "weight", "bias"
             # New format: Sequential with keys "0.weight", "0.bias", "2.weight", etc.
-            if verbose:
-                print("Warning: Old bbox_head format detected (single Linear layer)")
-                print("  Checkpoint has single Linear, but model uses Sequential (256→256→128→4)")
-                print("  Skipping bbox_head weights (architecture mismatch)")
-                print("  Model will use randomly initialized bbox_head")
+            skipped.append('bbox_head (old single-Linear format)')
         else:
             # New format: Sequential layers
             try:
@@ -176,9 +183,7 @@ def load_detection_model(model_path, device=None, weights_path='weights/dinov3_v
                 if verbose:
                     print("Loaded bbox_head weights (Sequential format)")
             except Exception as e:
-                if verbose:
-                    print(f"Warning: Failed to load bbox_head weights: {e}")
-                    print("  Model will use randomly initialized bbox_head")
+                skipped.append(f'bbox_head ({e})')
         
         if verbose:
             print("Loaded detection head weights")
@@ -193,7 +198,17 @@ def load_detection_model(model_path, device=None, weights_path='weights/dinov3_v
             print("2. Architecture parameters don't match checkpoint")
             print("3. Missing required checkpoint keys")
         raise RuntimeError(error_msg) from e
-    
+
+    if skipped:
+        summary = "\n".join(f"  - {s}" for s in skipped)
+        if not allow_partial:
+            raise RuntimeError(
+                "Checkpoint did not supply weights for these components, so they "
+                "would stay randomly initialised:\n" + summary +
+                "\n\nConvert the checkpoint, or pass allow_partial=True if you "
+                "genuinely want an untrained module here.")
+        print("WARNING: continuing with randomly initialised components:\n" + summary)
+
     model.to(device)
     model.eval()
     

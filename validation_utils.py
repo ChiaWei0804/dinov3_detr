@@ -10,6 +10,7 @@ This module contains functions for validating detection models:
 
 import torch
 from torch.amp import autocast
+from scipy.optimize import linear_sum_assignment
 from coco_dataset import decode_class_predictions
 from iou_utils import calculate_iou_batch_cxcywh
 
@@ -70,8 +71,15 @@ def validate_epoch(model, val_loader, loss_fn, device, confidence_threshold=0.1,
             total_iou += metrics['total_iou']
             correct_detections += metrics['correct_detections']
     
-    # Calculate averages
+    # An empty loader is a broken validation pipeline, not a result. Dividing by
+    # max(len, 1) would hand back avg_val_loss=0.0, which train.py reads as the
+    # best score it has ever seen and promptly saves as the best model. Say so
+    # instead of quietly producing a perfect-looking number.
     num_batches = len(val_loader)
+    if num_batches == 0:
+        raise RuntimeError(
+            "Validation loader produced no batches. Check the annotation file "
+            "and any filtering applied to the validation dataset.")
     avg_val_loss = val_loss / num_batches
     avg_val_l1_loss = val_l1_loss / num_batches
     avg_val_ciou_loss = val_ciou_loss / num_batches
@@ -115,8 +123,12 @@ def calculate_validation_metrics(outputs, targets, device, confidence_threshold=
         bbox_pred = outputs['pred_boxes']
     else:
         batch_size = outputs.shape[0]
-        cls_logits = outputs[:, :, :92]
-        bbox_pred = outputs[:, :, 92:]
+        # The box half is always the trailing 4 columns, so derive the split
+        # rather than hardcoding 92 - that silently produced an empty bbox
+        # tensor for any model configured with fewer classes.
+        num_cls = outputs.shape[-1] - 4
+        cls_logits = outputs[:, :, :num_cls]
+        bbox_pred = outputs[:, :, num_cls:]
     
     batch_size_val = cls_logits.shape[0]
     total_predictions = 0
@@ -152,23 +164,41 @@ def calculate_validation_metrics(outputs, targets, device, confidence_threshold=
         
         total_predictions += len(image_targets)
         
-        # Calculate IoU for each GT object
-        for gt_idx, (gt_bbox, gt_label) in enumerate(zip(gt_bboxes, gt_labels)):
-            # Find predictions with matching class
-            matching_mask = (keep_pred_labels == gt_label)
-            if matching_mask.sum() == 0:
-                continue
-            
-            matching_bboxes = keep_pred_bboxes[matching_mask]
-            
-            # Calculate IoU for each matching prediction against the GT bbox
-            # Use unsqueeze(0) to make gt_bbox [1, 4] for batch calculation
-            # This returns [N, 1] IoU values, one for each matching bbox
-            ious = calculate_iou_batch_cxcywh(matching_bboxes, gt_bbox.unsqueeze(0))
-            best_iou = ious.max().item()
-            
-            total_iou += best_iou
-            if best_iou >= iou_threshold:
+        # Optimal one-to-one assignment between predictions and GTs.
+        #
+        # Taking each GT's best-IoU prediction independently let ONE prediction
+        # satisfy several GTs of the same class, so two clustered people with a
+        # single overlapping box scored 2/2 recall instead of 1/2. That inflated
+        # number drives both best-model selection and early stopping in train.py.
+        #
+        # Walking the GTs greedily fixes the double-counting but under-reports
+        # instead: with an IoU matrix of [[0.9, 0.6], [0.8, 0.4]] the first GT
+        # takes the 0.9 prediction and the second is left with 0.4, scoring 1/2
+        # where the 0.6/0.8 pairing scores 2/2. Hungarian gets the assignment
+        # that maximises total IoU, so the metric depends on the predictions
+        # rather than on the order the annotations happen to be listed in.
+        ious_all = calculate_iou_batch_cxcywh(keep_pred_bboxes, gt_bboxes)  # [P, G]
+        class_ok = keep_pred_labels.unsqueeze(1) == gt_labels.unsqueeze(0)  # [P, G]
+        iou_matrix = torch.where(class_ok, ious_all, torch.zeros_like(ious_all))
+
+        # Maximising total IoU is NOT the same as maximising how many pairs clear
+        # the threshold, and recall counts the latter. With
+        #     [[1.00, 0.50],
+        #      [0.50, 0.49]]
+        # the largest sum is 1.00+0.49, which scores 1/2, while the 0.50+0.50
+        # pairing scores 2/2. Weighting a qualifying pair far above any possible
+        # IoU total makes the assignment maximise the count first and use raw IoU
+        # only to break ties.
+        # float64 for the score: fp32's spacing at 1e6 is 0.0625, which would
+        # quantise the IoU term away entirely and leave the tie-break arbitrary
+        # among pairs that all clear the threshold.
+        qualifies = (iou_matrix >= iou_threshold) & class_ok
+        score = qualifies.double() * 1e6 + iou_matrix.double()
+        pred_ind, gt_ind = linear_sum_assignment((-score).detach().cpu().numpy())
+        for p, g in zip(pred_ind, gt_ind):
+            iou = float(iou_matrix[p, g])
+            total_iou += iou
+            if iou >= iou_threshold and bool(class_ok[p, g]):
                 correct_detections += 1
     
     return {

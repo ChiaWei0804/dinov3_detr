@@ -11,6 +11,53 @@ This module provides comprehensive IoU calculation functions for object detectio
 import torch
 
 
+def _promote(boxes):
+    """
+    Widen fp16/bf16 boxes to fp32 BEFORE any area arithmetic happens.
+
+    Promoting at the division is too late: in fp16 a box of w=h=1e-4 has an area
+    of 1e-8, which is below the smallest representable subnormal, so the
+    multiplication underflows to exactly 0 and the IoU comes out 0 instead of 1.
+    No care taken afterwards can recover a value that is already gone.
+
+    fp64 is left alone so callers doing double-precision geometry keep it.
+    """
+    return boxes if boxes.dtype in (torch.float32, torch.float64) else boxes.float()
+
+
+def _safe_iou(intersection, union):
+    """
+    intersection / union, guarded against zero without distorting small boxes.
+
+    The previous `union.clamp(min=1e-7)` was a floor on the union itself, large
+    enough to swallow legitimate boxes: two identical 1e-4 boxes have a union of
+    1e-8 and came out at IoU 0.1 instead of 1.0. finfo.tiny sits far below any
+    representable area, so only a genuinely zero union is affected.
+
+    The clamp to [0, 1] absorbs the rounding that otherwise lets identical boxes
+    score slightly above 1 (measured 1.0049 under AMP), which turned `1 - IoU`
+    into a negative loss. Inputs are expected to have been through _promote.
+    """
+    uni = union.clamp(min=torch.finfo(union.dtype).tiny)
+    return (intersection / uni).clamp(0.0, 1.0)
+
+
+def _is_single_box(boxes):
+    """
+    True when `boxes` is one box rather than a sequence of them.
+
+    `len(boxes) == 4` alone misreads a (4, 4) NumPy array of four boxes as a
+    single box, because its first element is an ndarray rather than a
+    list/tuple, so the four rows get unpacked as x1/y1/x2/y2. Anything that
+    exposes .ndim answers the question directly; the length test is only a
+    fallback for plain Python sequences.
+    """
+    ndim = getattr(boxes, 'ndim', None)
+    if ndim is not None:
+        return ndim == 1
+    return len(boxes) == 4 and not isinstance(boxes[0], (list, tuple))
+
+
 def cxcywh_to_xyxy(boxes):
     """
     Convert boxes from [cx, cy, w, h] format to [x1, y1, x2, y2] format.
@@ -29,8 +76,9 @@ def cxcywh_to_xyxy(boxes):
         y2 = cy + h / 2
         return torch.stack([x1, y1, x2, y2], dim=-1)
     else:
-        # Python native
-        if len(boxes.shape) == 1:
+        # Python native. .shape is not available on a list, which is what the
+        # docstring says this branch accepts, so go through _is_single_box.
+        if _is_single_box(boxes):
             cx, cy, w, h = boxes
             return [cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2]
         else:
@@ -60,7 +108,7 @@ def xyxy_to_cxcywh(boxes):
         return torch.stack([cx, cy, w, h], dim=-1)
     else:
         # Python native
-        if len(boxes) == 4 and not isinstance(boxes[0], (list, tuple)):
+        if _is_single_box(boxes):
             x1, y1, x2, y2 = boxes
             return [(x1 + x2) / 2, (y1 + y2) / 2, x2 - x1, y2 - y1]
         else:
@@ -112,12 +160,17 @@ def _calculate_iou_xyxy_native(box1, box2):
 
 def _calculate_iou_xyxy_tensor(box1, box2):
     """PyTorch tensor implementation for [x1, y1, x2, y2] format"""
-    # Ensure tensors
+    # Ensure tensors. The caller dispatches here as soon as EITHER argument is a
+    # tensor, so build the other one on that tensor's device - defaulting to CPU
+    # makes torch.max fail on a device mismatch when the first is on CUDA.
+    ref = box1 if isinstance(box1, torch.Tensor) else box2
     if not isinstance(box1, torch.Tensor):
-        box1 = torch.tensor(box1, dtype=torch.float32)
+        box1 = torch.as_tensor(box1, dtype=torch.float32, device=ref.device)
     if not isinstance(box2, torch.Tensor):
-        box2 = torch.tensor(box2, dtype=torch.float32)
-    
+        box2 = torch.as_tensor(box2, dtype=torch.float32, device=ref.device)
+
+    box1, box2 = _promote(box1), _promote(box2)
+
     x1_1, y1_1, x2_1, y2_1 = box1[0], box1[1], box1[2], box1[3]
     x1_2, y1_2, x2_2, y2_2 = box2[0], box2[1], box2[2], box2[3]
     
@@ -129,9 +182,9 @@ def _calculate_iou_xyxy_tensor(box1, box2):
     intersection = (x2_i - x1_i).clamp(min=0) * (y2_i - y1_i).clamp(min=0)
     area1 = (x2_1 - x1_1) * (y2_1 - y1_1)
     area2 = (x2_2 - x1_2) * (y2_2 - y1_2)
-    union = (area1 + area2 - intersection).clamp(min=1e-7)
-    
-    return intersection / union
+    union = area1 + area2 - intersection
+
+    return _safe_iou(intersection, union)
 
 
 def calculate_iou_cxcywh(box1, box2):
@@ -146,6 +199,15 @@ def calculate_iou_cxcywh(box1, box2):
     Returns:
         IoU value (float or tensor)
     """
+    # Widen BEFORE the conversion, not after. cxcywh_to_xyxy computes cx +/- w/2,
+    # and fp16 near 0.5 has a spacing of ~4.9e-4, so a box of w=1e-4 collapses to
+    # zero width there - the corners are already identical by the time
+    # _calculate_iou_xyxy_tensor gets a chance to promote.
+    if isinstance(box1, torch.Tensor):
+        box1 = _promote(box1)
+    if isinstance(box2, torch.Tensor):
+        box2 = _promote(box2)
+
     # Convert to xyxy format and calculate
     box1_xyxy = cxcywh_to_xyxy(box1)
     box2_xyxy = cxcywh_to_xyxy(box2)
@@ -170,6 +232,8 @@ def calculate_iou_batch_xyxy(boxes1, boxes2):
     if not isinstance(boxes2, torch.Tensor):
         boxes2 = torch.tensor(boxes2, dtype=torch.float32)
     
+    boxes1, boxes2 = _promote(boxes1), _promote(boxes2)
+
     x1_1, y1_1, x2_1, y2_1 = boxes1[:, 0], boxes1[:, 1], boxes1[:, 2], boxes1[:, 3]
     x1_2, y1_2, x2_2, y2_2 = boxes2[:, 0], boxes2[:, 1], boxes2[:, 2], boxes2[:, 3]
     
@@ -188,9 +252,9 @@ def calculate_iou_batch_xyxy(boxes1, boxes2):
     # Calculate areas
     area1 = (x2_1 - x1_1) * (y2_1 - y1_1)
     area2 = (x2_2 - x1_2) * (y2_2 - y1_2)
-    union = (area1 + area2 - intersection).clamp(min=1e-7)
-    
-    return intersection / union
+    union = area1 + area2 - intersection
+
+    return _safe_iou(intersection, union)
 
 
 def calculate_iou_batch_cxcywh(boxes1, boxes2):
@@ -211,6 +275,8 @@ def calculate_iou_batch_cxcywh(boxes1, boxes2):
     if not isinstance(boxes2, torch.Tensor):
         boxes2 = torch.tensor(boxes2, dtype=torch.float32)
     
+    boxes1, boxes2 = _promote(boxes1), _promote(boxes2)
+
     cx1, cy1, w1, h1 = boxes1[:, 0], boxes1[:, 1], boxes1[:, 2], boxes1[:, 3]
     cx2, cy2, w2, h2 = boxes2[:, 0], boxes2[:, 1], boxes2[:, 2], boxes2[:, 3]
     
@@ -237,12 +303,14 @@ def calculate_iou_batch_cxcywh(boxes1, boxes2):
     
     intersection = (x2_i - x1_i).clamp(min=0) * (y2_i - y1_i).clamp(min=0)
     
-    # Calculate areas
-    area1 = w1 * h1
-    area2 = w2 * h2
-    union = (area1 + area2 - intersection).clamp(min=1e-7)
-    
-    return intersection / union
+    # Areas must come from the SAME converted corners the intersection uses.
+    # Deriving them from the raw w*h instead lets fp16 rounding make the
+    # intersection exceed the area, so identical boxes score above 1.
+    area1 = (x2_1 - x1_1) * (y2_1 - y1_1)
+    area2 = (x2_2 - x1_2) * (y2_2 - y1_2)
+    union = area1 + area2 - intersection
+
+    return _safe_iou(intersection, union)
 
 
 def calculate_iou_pairwise_cxcywh(boxes1, boxes2):
@@ -260,8 +328,8 @@ def calculate_iou_pairwise_cxcywh(boxes1, boxes2):
     Returns:
         Tensor of the broadcast shape (without the trailing 4)
     """
-    cx1, cy1, w1, h1 = boxes1.unbind(-1)
-    cx2, cy2, w2, h2 = boxes2.unbind(-1)
+    cx1, cy1, w1, h1 = _promote(boxes1).unbind(-1)
+    cx2, cy2, w2, h2 = _promote(boxes2).unbind(-1)
 
     x1_1, y1_1 = cx1 - w1 / 2, cy1 - h1 / 2
     x2_1, y2_1 = cx1 + w1 / 2, cy1 + h1 / 2
@@ -270,9 +338,12 @@ def calculate_iou_pairwise_cxcywh(boxes1, boxes2):
 
     intersection = ((torch.min(x2_1, x2_2) - torch.max(x1_1, x1_2)).clamp(min=0) *
                     (torch.min(y2_1, y2_2) - torch.max(y1_1, y1_2)).clamp(min=0))
-    union = (w1 * h1 + w2 * h2 - intersection).clamp(min=1e-7)
+    # Same reason as the batch version: areas from the converted corners, not
+    # from raw w*h, or fp16 lets identical boxes come out above 1.
+    union = ((x2_1 - x1_1) * (y2_1 - y1_1) +
+             (x2_2 - x1_2) * (y2_2 - y1_2) - intersection)
 
-    return intersection / union
+    return _safe_iou(intersection, union)
 
 
 # Convenience aliases for backward compatibility

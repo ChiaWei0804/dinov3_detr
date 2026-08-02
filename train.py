@@ -118,7 +118,11 @@ def train_detection_model(model, train_loader, val_loader, num_epochs=10, start_
     ENCODER_TARGET_LR = encoder_target_lr
 
     loss_fn = DetectionLoss(
-        num_classes=91,
+        # Must track the model: empty_weight is sized num_classes+1, and a
+        # mismatch with the model's logits blows up inside cross_entropy.
+        # Read it off the model rather than hardcoding 91, which silently
+        # decoupled the two whenever the caller passed anything else.
+        num_classes=model.num_classes,
         num_queries=num_queries,
         bbox_loss_weight=bbox_loss_weight,
         ciou_loss_weight=ciou_loss_weight,
@@ -176,33 +180,43 @@ def train_detection_model(model, train_loader, val_loader, num_epochs=10, start_
         # Skip loading optimizer state (Loss function changed - Cls Loss normalization fixed)
         # This ensures optimizer starts fresh with correct gradient history
         # Try to load optimizer state, but fail gracefully if architecture changed
+        optimizer_state_loaded = False
         if 'optimizer' in resume_checkpoint:
             try:
                 optimizer.load_state_dict(resume_checkpoint['optimizer'])
+                optimizer_state_loaded = True
                 print("Optimizer state loaded successfully.")
             except Exception as e:
                 print(f"WARNING: Skipping optimizer state (Architecture mismatch): {e}")
                 print("   Optimizer will start fresh for compatibility")
-        
-        # Set correct LR based on current epoch (considering warmup)
+
+        # A loaded optimizer state carries whatever LR ReduceLROnPlateau had
+        # settled on. Overwriting it unconditionally threw that away on every
+        # resume: a run that had decayed to 7.5e-5 restarted at 1e-4 while the
+        # scheduler state restored below still believed it was low. Warmup is a
+        # schedule rather than a plateau reduction, so it still wins while it runs.
         if start_epoch < WARMUP_EPOCHS:
-            # Still in warmup phase
             warmup_progress = (start_epoch + 1) / WARMUP_EPOCHS
             current_encoder_lr = ENCODER_WARMUP_LR + (ENCODER_TARGET_LR - ENCODER_WARMUP_LR) * warmup_progress
             if len(optimizer.param_groups) >= 1:
                 optimizer.param_groups[0]['lr'] = current_encoder_lr
             print(f"   Encoder LR set to warmup value: {current_encoder_lr:.6f}")
-        else:
-            # Warmup completed
+        elif not optimizer_state_loaded:
             if len(optimizer.param_groups) >= 1:
                 optimizer.param_groups[0]['lr'] = ENCODER_TARGET_LR
             print(f"   Encoder LR set to normal value: {ENCODER_TARGET_LR:.6f}")
-        
-        if len(optimizer.param_groups) >= 2:
-            optimizer.param_groups[1]['lr'] = backbone_lr
-        if len(optimizer.param_groups) >= 3:
-            optimizer.param_groups[2]['lr'] = decoder_lr
-        
+        else:
+            print(f"   Encoder LR kept from checkpoint: "
+                  f"{optimizer.param_groups[0]['lr']:.6f}")
+
+        # Same reasoning for the other two groups: only impose the configured
+        # values when there was no state to restore them from.
+        if not optimizer_state_loaded:
+            if len(optimizer.param_groups) >= 2:
+                optimizer.param_groups[1]['lr'] = backbone_lr
+            if len(optimizer.param_groups) >= 3:
+                optimizer.param_groups[2]['lr'] = decoder_lr
+
         encoder_lr = optimizer.param_groups[0]['lr'] if len(optimizer.param_groups) >= 1 else 0.0001
         backbone_lr = optimizer.param_groups[1]['lr'] if len(optimizer.param_groups) >= 2 else 0.0001
         decoder_lr = optimizer.param_groups[2]['lr'] if len(optimizer.param_groups) >= 3 else 0.0001
@@ -390,6 +404,15 @@ def train_detection_model(model, train_loader, val_loader, num_epochs=10, start_
         tracker.log_epoch(epoch, epoch_train_metrics, epoch_val_metrics, epoch_lrs)
 
         # Early Stopping check
+        #
+        # `is_best` decides which weights land in best_coco_detection_head.pth, so
+        # it follows ONE criterion. Letting either metric set it meant the file
+        # could hold the best-recall epoch while the manifest beside it reported a
+        # best_val_loss from a different epoch. Loss is the criterion because
+        # recall here is a coarse single-threshold proxy.
+        #
+        # `improved` is separate and stays permissive: either metric moving counts
+        # as progress for the early-stopping counter.
         is_best = False
         improved = False
         if avg_val_loss < best_val_loss:
@@ -398,7 +421,6 @@ def train_detection_model(model, train_loader, val_loader, num_epochs=10, start_
             improved = True
         if recall_iou05 > best_val_acc:
             best_val_acc = recall_iou05
-            is_best = True
             improved = True
         
         if improved:
@@ -433,7 +455,10 @@ def train_detection_model(model, train_loader, val_loader, num_epochs=10, start_
 
     print(f'\nTraining completed!')
     print(f'Best Val Loss: {best_val_loss:.4f}, Best Recall: {best_val_acc*100:.2f}%')
-    return model, train_losses, val_losses, val_accuracies
+    # best_val_loss / best_val_acc are returned rather than recomputed by the
+    # caller: they span the whole run (seeded from the checkpoint on resume),
+    # whereas val_losses/val_accuracies only cover the epochs of THIS segment.
+    return model, train_losses, val_losses, val_accuracies, best_val_loss, best_val_acc
 
 
 
@@ -673,7 +698,8 @@ def main():
         resumed_from=checkpoint_path if resume_training else None,
     )
 
-    trained_model, train_losses, val_losses, val_accuracies = train_detection_model(
+    (trained_model, train_losses, val_losses, val_accuracies,
+     best_val_loss, best_val_acc) = train_detection_model(
         model,
         train_loader,
         val_loader,
@@ -719,9 +745,11 @@ def main():
     torch.save(final_save_dict, final_path)
     print(f"Final model saved to: {final_path}")
 
-    best_val_loss = min(val_losses) if val_losses else float('inf')
-    best_val_acc = max(val_accuracies) if val_accuracies else 0.0
-
+    # best_val_loss / best_val_acc already track the whole run: they are seeded
+    # from the checkpoint on resume and updated each epoch. Recomputing them from
+    # val_losses / val_accuracies - which only cover the epochs of THIS segment -
+    # made a resumed run report the best of the resumed part as if it were the
+    # best overall, hiding a better earlier epoch.
     if val_losses:
         tracker.write_manifest(
             final_path, start_epoch + len(val_losses) - 1,

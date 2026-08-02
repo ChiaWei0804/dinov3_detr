@@ -14,7 +14,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from scipy.optimize import linear_sum_assignment
 from coco_dataset import BACKGROUND_CLASS_INDEX
-from iou_utils import calculate_iou_batch_cxcywh, calculate_iou_pairwise_cxcywh
+from iou_utils import (calculate_iou_batch_cxcywh, calculate_iou_pairwise_cxcywh,
+                       _safe_iou, _promote)
 
 
 def complete_box_iou(boxes1, boxes2):
@@ -30,6 +31,11 @@ def complete_box_iou(boxes1, boxes2):
     - v: aspect ratio consistency
     """
     # 1. Convert to [x1, y1, x2, y2]
+    # Widen first: in fp16 the area of a 1e-4 box underflows to zero, so every
+    # term below - intersection, union, the aspect-ratio arctans - would be
+    # computed from values that have already lost their magnitude.
+    boxes1, boxes2 = _promote(boxes1), _promote(boxes2)
+
     cx1, cy1, w1, h1 = boxes1.unbind(-1)
     x1_1 = cx1 - 0.5 * w1
     y1_1 = cy1 - 0.5 * h1
@@ -50,10 +56,13 @@ def complete_box_iou(boxes1, boxes2):
     intersection = (x2_i - x1_i).clamp(min=0) * (y2_i - y1_i).clamp(min=0)
 
     # 3. Calculate union and IoU
-    area1 = w1 * h1
-    area2 = w2 * h2
-    union = (area1 + area2 - intersection).clamp(min=1e-7)
-    iou = intersection / union
+    # Areas come from the converted corners, not from raw w*h: under AMP the two
+    # disagree by enough that identical boxes scored 1.0049, which made the
+    # `1 - ciou` loss negative and flipped the sign of alpha's denominator below.
+    area1 = (x2_1 - x1_1) * (y2_1 - y1_1)
+    area2 = (x2_2 - x1_2) * (y2_2 - y1_2)
+    union = area1 + area2 - intersection
+    iou = _safe_iou(intersection, union)
 
     # 4. Calculate center distance (ρ²)
     center_distance_sq = (cx1 - cx2) ** 2 + (cy1 - cy2) ** 2
@@ -128,7 +137,8 @@ class DetectionLoss(nn.Module):
     """
     def __init__(self, bbox_loss_weight=5.0, ciou_loss_weight=5.0, cls_loss_weight=2.0,
                  num_classes=91, num_queries=100, max_targets_per_image=100,
-                 aux_loss_weight=0.4, eos_coef=0.1, enc_loss_weight=1.0):
+                 aux_loss_weight=0.4, eos_coef=0.1, enc_loss_weight=1.0,
+                 aux_rematch=True):
         """
         Initialize detection loss function.
 
@@ -145,6 +155,12 @@ class DetectionLoss(nn.Module):
                 without this the background term drowns out the foreground term.
             enc_loss_weight: Weight of the encoder objectness loss that supervises
                 Mixed Query Selection (default: 1.0)
+            aux_rematch: Run Hungarian matching separately for every auxiliary
+                head (default: True, which is what DETR does). Reusing the final
+                layer's assignment is cheaper - one matching per step instead of
+                one per decoder layer - but an intermediate layer whose best
+                assignment differs then gets gradient pushed onto the wrong
+                query. Set False to trade that correctness back for speed.
         """
         super().__init__()
         self.bbox_loss_weight = bbox_loss_weight
@@ -155,6 +171,7 @@ class DetectionLoss(nn.Module):
         self.max_targets_per_image = max_targets_per_image
         self.aux_loss_weight = aux_loss_weight
         self.enc_loss_weight = enc_loss_weight
+        self.aux_rematch = aux_rematch
 
         # Use L1 Loss, reduction='none'
         self.l1_loss = nn.L1Loss(reduction='none')
@@ -225,8 +242,12 @@ class DetectionLoss(nn.Module):
 
         Optimizations:
         1. GT data loaded to GPU ONCE (not 6 times)
-        2. Hungarian matching done ONCE (not 6 times)
-        3. All computations on GPU (minimize CPU involvement)
+        2. All computations on GPU (minimize CPU involvement)
+
+        Matching runs once per head by default (aux_rematch=True), matching
+        DETR. Set aux_rematch=False to reuse the final layer's assignment for
+        every auxiliary head, which is faster but assigns gradient to queries
+        the intermediate layer did not choose.
 
         This keeps GPU utilization high (>80%) and training fast.
 
@@ -279,20 +300,36 @@ class DetectionLoss(nn.Module):
 
         # === Compute auxiliary losses (reuse GT data and matches) ===
         aux_loss = torch.zeros((), device=device)
-        if isinstance(outputs, dict) and len(outputs.get('aux_outputs', ())) > 0:
-            for aux_output in outputs['aux_outputs']:
+        aux_outputs = outputs.get('aux_outputs') if isinstance(outputs, dict) else None
+        if aux_outputs:
+            for aux_output in aux_outputs:
+                if self.aux_rematch:
+                    # DETR matches each decoder layer independently. Reusing the
+                    # final layer's assignment sends this layer's gradient to
+                    # whichever query the LAST layer picked, which is not
+                    # necessarily the one this layer predicts best.
+                    aux_matches = self._do_hungarian_matching_fast(
+                        aux_output['pred_logits'], aux_output['pred_boxes'],
+                        batch_gt_data, flat_boxes, flat_classes, gt_batch_ids
+                    )
+                    aux_match_index = self._flatten_matches(
+                        aux_matches, batch_gt_data, device)
+                else:
+                    aux_match_index = match_index
+
                 aux_l, _, _, _ = self._compute_loss_fast(
                     aux_output['pred_logits'],
                     aux_output['pred_boxes'],
-                    match_index,    # ← REUSE flattened matches!
+                    aux_match_index,
                     flat_boxes,     # ← REUSE pre-loaded GT data!
                     flat_classes,
-                    num_boxes
+                    num_boxes       # matching is complete on the GT side, so the
+                                    # count is the same for every layer
                 )
                 aux_loss = aux_loss + aux_l
 
             # Average auxiliary losses
-            aux_loss = aux_loss / len(outputs['aux_outputs'])
+            aux_loss = aux_loss / len(aux_outputs)
 
         # === Encoder objectness loss (supervises Mixed Query Selection) ===
         enc_loss = torch.zeros((), device=device)
@@ -387,7 +424,10 @@ class DetectionLoss(nn.Module):
         # Object patches are a small minority; rebalance so they are not ignored.
         num_pos = targets.sum().clamp(min=1.0)
         num_neg = (targets.numel() - targets.sum()).clamp(min=0.0)
-        pos_weight = (num_neg / num_pos).clamp(max=100.0)
+        # The lower clamp matters: with no negatives at all (a GT box covering the
+        # whole grid) the ratio is 0, which zeroes every positive term and leaves
+        # topk_score_head with no gradient for that step. Fall back to unweighted.
+        pos_weight = (num_neg / num_pos).clamp(min=1.0, max=100.0)
 
         return F.binary_cross_entropy_with_logits(
             enc_logits.float(), targets, pos_weight=pos_weight

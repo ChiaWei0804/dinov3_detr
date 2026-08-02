@@ -1,21 +1,29 @@
+import os
+import sys
+
+# 若遇到 Conda DLL 載入問題，設定環境變數 DINOV3_EXTRA_DLL_DIR 指向
+# <env>\Library\bin 即可，不要把個別機器的絕對路徑寫死在程式裡。
+#
+# 這段必須排在 import torch 之前：它存在的目的就是讓 torch 找得到 DLL，
+# 而 torch 一旦先 import 完，PATH 再怎麼改都來不及了。
+_extra_dll_dir = os.environ.get('DINOV3_EXTRA_DLL_DIR')
+if _extra_dll_dir and os.path.isdir(_extra_dll_dir):
+    os.environ['PATH'] = _extra_dll_dir + os.pathsep + os.environ['PATH']
+    if hasattr(os, 'add_dll_directory'):  # Windows: PATH alone is not enough
+        # The handle must stay referenced - dropping it removes the directory
+        # from the search path again, which would undo this on the next GC.
+        _dll_handle = os.add_dll_directory(_extra_dll_dir)
+    print(f"Fixed DLL path: Added {_extra_dll_dir} to PATH")
+
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 from torchvision.datasets import CocoDetection
-import os
 import json
 import argparse
 from tqdm import tqdm
 from pycocotools.coco import COCO
 from pycocotools.cocoeval import COCOeval
-
-import sys
-# 若遇到 Conda DLL 載入問題，設定環境變數 DINOV3_EXTRA_DLL_DIR 指向
-# <env>\Library\bin 即可，不要把個別機器的絕對路徑寫死在程式裡。
-_extra_dll_dir = os.environ.get('DINOV3_EXTRA_DLL_DIR')
-if _extra_dll_dir and os.path.isdir(_extra_dll_dir):
-    os.environ['PATH'] = _extra_dll_dir + os.pathsep + os.environ['PATH']
-    print(f"Fixed DLL path: Added {_extra_dll_dir} to PATH")
 
 # 引入您專案中的模組
 from dinov3_detection_model import DINOv3DetectionModel
@@ -32,6 +40,15 @@ class COCOEvalDataset(CocoDetection):
         super().__init__(root, annFile, transform=None)
         
         # [修正 2] 將 transform 存在自己的屬性中，稍後手動呼叫
+        #
+        # transform=None 時 __getitem__ 會原樣回傳 PIL Image，而 collate_fn_eval
+        # 直接對它做 torch.stack，會在建立 DataLoader 之後才以 TypeError 爆掉。
+        # 與其讓它拖到那時候，不如在這裡就講清楚。
+        if transform is None:
+            raise ValueError(
+                "COCOEvalDataset 需要一個 transform（例如 coco_dataset 的 "
+                "global_val_transform）。transform=None 會讓 __getitem__ 回傳 "
+                "PIL Image，collate 階段的 torch.stack 必然失敗。")
         self.eval_transform = transform
 
     def __getitem__(self, index):
@@ -215,18 +232,47 @@ def main():
             model.bbox_head.load_state_dict(checkpoint['bbox_head'])
             print("權重載入成功 (分塊載入)。")
         except KeyError as e:
-            print(f"載入失敗，缺少鍵值: {e}")
-            print("嘗試直接載入整個字典...")
-            model.load_state_dict(checkpoint, strict=False)
-            
+            # 舊的 fallback 是 model.load_state_dict(checkpoint, strict=False)，
+            # 但這個巢狀字典的鍵是「元件名稱」而非參數名稱，所以一個權重都載不進去，
+            # strict=False 又把它壓下來 —— 評估就在隨機初始化的模型上跑完了。
+            raise RuntimeError(
+                f"Checkpoint 缺少元件 {e}，無法以分塊格式載入。"
+                f"請改用完整的 checkpoint，不要讓評估在未載入權重的模型上進行。"
+            ) from e
+
     else:
         # 可能是標準的 state_dict 格式 (例如 final_xxx.pth)
         state_dict = checkpoint['model'] if 'model' in checkpoint else checkpoint
+        # DataParallel / DDP 會在每個鍵前面加 "module."，不剝掉的話下面的過濾
+        # 會得到空字典，而 strict=False 會讓它看起來像是載入成功。
+        if any(k.startswith('module.') for k in state_dict):
+            state_dict = {k[len('module.'):] if k.startswith('module.') else k: v
+                          for k, v in state_dict.items()}
         model_keys = model.state_dict().keys()
         # 過濾掉不匹配的鍵值 (例如凍結的 backbone 部分如果沒存)
         filtered_dict = {k: v for k, v in state_dict.items() if k in model_keys}
+        # 只檢查「非空」不夠：checkpoint 只含 cls_head.* 時 filtered_dict 也非空，
+        # strict=False 會讓 decoder、bbox_head 保持隨機初始化然後照樣跑完評估。
+        # 逐一比對每個頂層元件，缺哪個就講哪個。
+        # 逐一比對「參數」而非只看元件前綴。只確認每個元件至少有一個 key 是不夠的：
+        # decoder 只剩一個參數時它仍會被視為存在，strict=False 讓其餘參數靜靜地
+        # 保持隨機初始化。backbone 是凍結的、通常不存在 checkpoint 裡，所以只對
+        # 這 7 個偵測頭元件要求完整。
+        components = ('patch_proj', 'cls_proj', 'encoder', 'topk_score_head',
+                      'decoder', 'cls_head', 'bbox_head')
+        expected = {k for k in model.state_dict()
+                    if k.split('.')[0] in components}
+        missing = sorted(expected - set(filtered_dict))
+        if missing:
+            preview = ', '.join(missing[:6]) + (' ...' if len(missing) > 6 else '')
+            raise RuntimeError(
+                f"Checkpoint 缺少 {len(missing)}/{len(expected)} 個偵測頭參數，"
+                f"它們會維持隨機初始化：{preview}"
+                f"（checkpoint 共 {len(state_dict)} 個鍵，對上 {len(filtered_dict)} 個）。"
+                f"用這種模型做評估得到的 mAP 沒有意義。")
         model.load_state_dict(filtered_dict, strict=False)
-        print("權重載入成功 (標準格式)。")
+        print(f"權重載入成功 (標準格式)：{len(filtered_dict)}/{len(model_keys)} 個鍵，"
+              f"{len(components)} 個元件齊全")
     
     model.to(device)
     

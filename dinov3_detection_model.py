@@ -78,10 +78,12 @@ DETR architecture based on DINOv3 Backbone.
         # Import here to avoid circular dependency
         from model_loader import load_dinov3_backbone
         
-        repo_dir = os.getcwd()
+        # repo_dir=None lets the loader anchor to its own directory. Passing
+        # os.getcwd() here meant hubconf.py and the relative weights path were
+        # resolved against wherever the caller happened to be running from.
         self.backbone = load_dinov3_backbone(
             weights_path=weights_path,
-            repo_dir=repo_dir,
+            repo_dir=None,
             freeze=True
         )
 
@@ -190,7 +192,19 @@ DETR architecture based on DINOv3 Backbone.
         # Calculate spatial grid size from actual patch tokens (dynamic based on input resolution)
         # DINOv3 ViT-B/16: patch_size=16, so for 800×800 input → 50×50 grid
         num_patches = patch_tokens.shape[1]
-        h = w = int(num_patches ** 0.5)  # Assume square grid
+        # Derive the grid from the actual input instead of sqrt(num_patches).
+        # A non-square input - 640x800 gives 40x50 = 2000 patches - rounds to
+        # 44x44 = 1936 under the square assumption, which both mismatches on the
+        # positional-encoding add and corrupts the reference points computed from
+        # `w` below. The dataset resizes to a square today, so this is a guard
+        # against that changing rather than a live failure.
+        patch_size = getattr(self.backbone, 'patch_size', 16)
+        h, w = x.shape[-2] // patch_size, x.shape[-1] // patch_size
+        if h * w != num_patches:
+            raise RuntimeError(
+                f"Patch grid {h}x{w} ({h * w}) does not match the {num_patches} "
+                f"tokens returned for input {tuple(x.shape[-2:])} "
+                f"(patch_size={patch_size})")
         pos_encoding = self.pos_embed(batch_size, h, w, device)  # [B, num_patches, 256]
         
         # ===== 3. Transformer Encoder (independent module) =====
