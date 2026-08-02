@@ -1,0 +1,46 @@
+# DINOv3 DETR Object Detection Requirements
+# =========================================
+
+# Deep Learning Framework (CUDA 12.8)
+# Install with: pip3 install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+# NOTE: Do NOT use 'pip install -r requirements.txt' for torch/torchvision
+# Use the command above instead to get CUDA 12.8 support
+# torch>=2.0.0
+# torchvision>=0.15.0
+
+# DINOv3 Model (from facebookresearch)
+timm>=0.9.0
+
+# COCO Dataset and Evaluation
+pycocotools>=2.0.6
+
+# Scientific Computing
+# NOTE: NumPy must be <2.0 for compatibility with scipy and torchmetrics
+numpy>=1.24.0,<2.0.0
+scipy>=1.10.0
+
+# Image Processing
+Pillow>=9.5.0
+opencv-python==4.8.1.78
+
+# Visualization
+matplotlib>=3.7.0
+graphviz>=0.20.0
+
+# Progress Bar and Terminal Utilities
+tqdm>=4.65.0
+termcolor>=2.0.0
+
+# Metrics (required by DINOv3)
+torchmetrics>=0.11.0
+
+# Experiment Tracking (OPTIONAL)
+# Training runs fine without it - tracking.py degrades gracefully and the JSON
+# checkpoint manifests are written either way. Install to compare runs in a UI:
+#   pip install mlflow
+#   mlflow ui --backend-store-uri mlruns
+mlflow>=2.9.0
+
+# Optional: For plotting utilities (in Plain-DETR-main)
+pandas>=2.0.0
+seaborn>=0.12.0

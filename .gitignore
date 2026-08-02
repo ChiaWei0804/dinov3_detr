@@ -1,0 +1,30 @@
+# 模型權重與 checkpoint（weights/ 有 327MB，不進版控）
+weights/
+*.pth
+*.pt
+*.ckpt
+
+# 訓練輸出
+runs/
+
+# 簡報素材
+ppt/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Claude Code 個人本機覆寫（含本機專屬路徑，不該跨機器共用）
+.claude/settings.local.json
+
+# 內部交接文件，不上傳
+TRAINING_HANDOFF.md
+
+# OS / 編輯器
+Thumbs.db
+.DS_Store
+.vscode/
+.idea/
