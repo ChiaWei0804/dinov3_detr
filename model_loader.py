@@ -10,6 +10,7 @@ This module contains functions for loading DINOv3 detection models:
 import torch
 import os
 from dinov3_detection_model import DINOv3DetectionModel
+from coco_dataset import COCO_NUM_CLASSES
 
 
 def load_dinov3_backbone(weights_path='weights/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth', 
@@ -109,7 +110,7 @@ def load_detection_model(model_path, device=None, weights_path='weights/dinov3_v
     # so skip those extra head evaluations.
     model = DINOv3DetectionModel(
         weights_path=weights_path,
-        num_classes=91,
+        num_classes=COCO_NUM_CLASSES,
         num_queries=num_queries,
         num_encoder_layers=num_encoder_layers,
         num_decoder_layers=num_decoder_layers,

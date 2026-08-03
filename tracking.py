@@ -41,7 +41,18 @@ import torch
 #   3 = bbox_head now predicts a centre OFFSET from the selected patch's centre
 #       (reference point) rather than an absolute coordinate, so its weights are
 #       not interchangeable with version 2 even though the tensor shapes match.
-LOSS_SEMANTICS_VERSION = 3
+#   4 = three changes that each move the recorded numbers:
+#       (a) the encoder objectness target went from "every patch whose centre is
+#           inside a GT box" to a small block on each GT's centre, so `enc` is a
+#           different quantity - and its pos_weight ceiling rose 100 -> 400;
+#       (b) Hungarian matching now scores with the CONFIGURED loss weights and
+#           with CIoU instead of plain IoU, so the assignment - and therefore
+#           every box term computed from it - differs;
+#       (c) ciou_loss_weight 2.0 -> 5.0 and aux_loss_weight 0 -> 0.4, which
+#           together scale total loss by about 1.5x on identical predictions.
+#       A version-3 best_val_loss is NOT beatable by a version-4 run; see the
+#       resume guard in train.py.
+LOSS_SEMANTICS_VERSION = 4
 
 # Structure version of the manifest file itself.
 MANIFEST_SCHEMA_VERSION = 1

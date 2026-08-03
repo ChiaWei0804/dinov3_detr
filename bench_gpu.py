@@ -30,6 +30,7 @@ from torch.amp import autocast, GradScaler
 
 from dinov3_detection_model import DINOv3DetectionModel
 from detection_loss import DetectionLoss
+from coco_dataset import COCO_NUM_CLASSES
 
 
 def main():
@@ -56,13 +57,13 @@ def main():
     print(f"batch={args.batch_size}  resolution={args.resolution}  "
           f"enc={args.encoder_layers}  dec={args.decoder_layers}  queries={args.queries}\n")
 
-    model = DINOv3DetectionModel(num_classes=91, num_queries=args.queries,
+    model = DINOv3DetectionModel(num_classes=COCO_NUM_CLASSES, num_queries=args.queries,
                                  num_encoder_layers=args.encoder_layers,
                                  num_decoder_layers=args.decoder_layers,
                                  num_aux_layers=0).to(dev)
     model.train()
 
-    loss_fn = DetectionLoss(num_classes=91, num_queries=args.queries,
+    loss_fn = DetectionLoss(num_classes=COCO_NUM_CLASSES, num_queries=args.queries,
                             aux_loss_weight=0, enc_loss_weight=1.0).to(dev)
     opt = torch.optim.AdamW([p_ for p_ in model.parameters() if p_.requires_grad], lr=1e-4)
     scaler = GradScaler('cuda')

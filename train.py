@@ -38,6 +38,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.amp import autocast, GradScaler
+import json
 import os
 import sys
 import traceback
@@ -47,10 +48,10 @@ from tqdm import tqdm
 # Import from custom modules
 from dinov3_detection_model import DINOv3DetectionModel, PositionEmbeddingSine
 from detection_loss import DetectionLoss, complete_box_iou, hungarian_matching_simple
-from coco_dataset import load_coco_dataset
+from coco_dataset import load_coco_dataset, COCO_NUM_CLASSES
 from training_utils import find_latest_checkpoint
 from validation_utils import validate_epoch
-from tracking import ExperimentTracker, setup_file_logging
+from tracking import ExperimentTracker, setup_file_logging, LOSS_SEMANTICS_VERSION
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # Windows spawns DataLoader workers by re-importing this module (as
@@ -60,7 +61,7 @@ if __name__ == '__main__':
 
 
 def build_checkpoint(model, optimizer, scheduler, scaler, epoch,
-                     best_val_loss, best_val_acc, epochs_no_improve):
+                     best_val_loss, best_val_acc, epochs_no_improve, loss_fn):
     """
     Assemble a resumable checkpoint.
 
@@ -87,6 +88,13 @@ def build_checkpoint(model, optimizer, scheduler, scaler, epoch,
         'best_val_loss': best_val_loss,
         'best_val_acc': best_val_acc,
         'epochs_no_improve': epochs_no_improve,
+        # Stamped so a resume can tell whether best_val_loss was computed under
+        # the same loss definition this run uses. Checkpoints written before this
+        # field existed simply have no key, which is handled as "older".
+        'loss_semantics_version': LOSS_SEMANTICS_VERSION,
+        # The version constant only moves when someone edits it. This snapshot
+        # catches the configuration changes it silently misses.
+        'loss_weights': loss_fn.loss_scale_signature(),
     }
 
 
@@ -257,6 +265,75 @@ def train_detection_model(model, train_loader, val_loader, num_epochs=10, start_
         epochs_no_improve = resume_checkpoint.get('epochs_no_improve', epochs_no_improve)
         print(f"   Restored best: val_loss={best_val_loss:.4f}, recall={best_val_acc*100:.2f}%, "
               f"no-improve streak={epochs_no_improve}")
+
+        # A best_val_loss computed under a DIFFERENT loss definition is not a
+        # threshold this run can clear. Measured for the v3 -> v4 change: the same
+        # predictions score 1.52x higher, so a v3 best of 2.6158 lands near 3.99
+        # here - nothing ever beats it, no "best" checkpoint is ever written
+        # again, and epochs_no_improve climbs until early stopping fires for no
+        # real reason.
+        #
+        # RESET rather than warn. An earlier version only printed a warning, which
+        # was worse than useless: build_checkpoint() stamps the very next save
+        # with the CURRENT version while the stale best_val_loss rides along
+        # inside it, so from the second resume onwards the versions match, the
+        # warning never fires again, and the bad threshold is now invisible.
+        # There is also no correct alternative to resetting - a threshold from a
+        # different loss definition is not a threshold at all.
+        #
+        # best_val_acc goes too: the recall metric changed with the same batch of
+        # work (one-to-one Hungarian assignment instead of per-GT best match), so
+        # the stored value is inflated relative to what this run can produce.
+        # Two independent ways the stored best can become incomparable, and
+        # neither subsumes the other:
+        #   - the version constant, for changes to what the loss MEANS (a new enc
+        #     target, matching on CIoU instead of IoU). Hand-maintained.
+        #   - the weight signature, for changes to its MAGNITUDE. Automatic.
+        # Measured for the second kind: aux_loss_weight 0.4 -> 0 takes the same
+        # predictions from 24.63 to 17.75 (0.72x) with the version untouched, and
+        # the smaller number reads as an improvement.
+        ckpt_semantics = resume_checkpoint.get('loss_semantics_version')
+        ckpt_weights = resume_checkpoint.get('loss_weights')
+        current_weights = loss_fn.loss_scale_signature()
+        version_changed = ckpt_semantics != LOSS_SEMANTICS_VERSION
+        weights_changed = ckpt_weights != current_weights
+
+        if version_changed or weights_changed:
+            stale = (best_val_loss, best_val_acc, epochs_no_improve)
+            best_val_loss = float('inf')
+            best_val_acc = 0.0
+            epochs_no_improve = 0
+            # The plateau scheduler tracked the old scale too, so its notion of
+            # "best" is stale in exactly the same way. mode_worse is the sentinel
+            # ReduceLROnPlateau itself starts from.
+            scheduler.best = getattr(scheduler, 'mode_worse', float('inf'))
+            scheduler.num_bad_epochs = 0
+
+            print("\n" + "!" * 70)
+            print("Loss definition changed since this checkpoint was written.")
+            if version_changed:
+                print(f"  checkpoint loss_semantics_version : {ckpt_semantics if ckpt_semantics is not None else 'absent (pre-versioning)'}")
+                print(f"  this run                          : {LOSS_SEMANTICS_VERSION}")
+            if weights_changed:
+                if ckpt_weights is None:
+                    print("  checkpoint records no loss weights (written before they were stored)")
+                else:
+                    print("  loss weights differ:")
+                    for key in sorted(set(ckpt_weights) | set(current_weights)):
+                        was, now = ckpt_weights.get(key), current_weights.get(key)
+                        if was != now:
+                            print(f"    {key:18s} {was} -> {now}")
+            print("")
+            print("  Early-stopping bookkeeping has been RESET (model weights and")
+            print("  optimizer state are untouched):")
+            print(f"    best_val_loss     {stale[0]:.4f} -> inf")
+            print(f"    best_val_acc      {stale[1] * 100:.2f}% -> 0.00%")
+            print(f"    epochs_no_improve {stale[2]} -> 0")
+            print("    scheduler plateau state reset as well")
+            print("")
+            print("  The next improving epoch will therefore write a new best")
+            print("  model, replacing the one saved under the old definition.")
+            print("!" * 70 + "\n")
 
     # Check current LR
     current_lrs = [group['lr'] for group in optimizer.param_groups]
@@ -433,7 +510,8 @@ def train_detection_model(model, train_loader, val_loader, num_epochs=10, start_
         def _save(filename):
             path = os.path.join(save_dir, filename)
             torch.save(build_checkpoint(model, optimizer, scheduler, scaler, epoch,
-                                        best_val_loss, best_val_acc, epochs_no_improve), path)
+                                        best_val_loss, best_val_acc, epochs_no_improve,
+                                        loss_fn), path)
             tracker.write_manifest(path, epoch, epoch_train_metrics, epoch_val_metrics,
                                    epoch_lrs, best_val_loss, best_val_acc,
                                    epochs_no_improve, architecture=architecture)
@@ -467,8 +545,17 @@ def main():
     # Modify these parameters to customize your training
     
     # === Model Architecture ===
-    num_classes = 91               # COCO classes (80 objects + 1 background, output=91)
-    num_queries = 100              # Number of object queries (100-300)
+    # Not a free knob: model_loader.py and eval_coco.py rebuild the model with
+    # this same constant, and any other value yields a checkpoint they cannot
+    # load. DetectionLoss rejects anything else outright.
+    num_classes = COCO_NUM_CLASSES  # COCO classes (raw category_ids 1..90 + background at 0)
+    # Raised from 100. At 100 the extra queries were largely redundant - measured
+    # AR@10=0.364 vs AR@100=0.387, i.e. 90 further detections bought 0.023 - but
+    # that was under the old encoder objectness target, where one large object
+    # supplied 780 of 2500 positive patches and top-K could spend the whole
+    # budget inside it. With per-object centre blocks the selection has a reason
+    # to spread out, so a larger budget should now buy distinct objects.
+    num_queries = 200              # Number of object queries (100-300)
     num_encoder_layers = 2         # Transformer encoder layers (2-6) 太多層encoder很難訓練，backbone本身的特徵提取能力就很強了，所以不需太多層
     num_decoder_layers = 6         # Transformer decoder layers (4-8)
     num_aux_layers = 2             # Intermediate decoder layers feeding aux loss (0 to disable)
@@ -496,12 +583,24 @@ def main():
     
     # === Loss Weights ===
     bbox_loss_weight = 8           # L1 bounding box loss weight (5.0-15.0)
-    ciou_loss_weight = 2.0         # CIoU loss weight (2.0-8.0)
+    # L1 on normalized cxcywh is scale-DEPENDENT: the same 50% relative error
+    # costs 0.058 on a small box and 0.292 on a large one. CIoU is scale
+    # invariant and is the only term counteracting that, so at 8/2 a small
+    # object received 46% of the box loss a large one did for the same mistake.
+    # Measured small/large loss ratio: 8/2 -> 0.458, 5/2 -> 0.546, 5/5 -> 0.725.
+    # Raised to 5.0 to close most of the gap without inverting it.
+    ciou_loss_weight = 5.0         # CIoU loss weight (2.0-8.0)
     # NOTE: the classification loss is now a DETR-style weighted mean over all
     # queries instead of a sum divided by the matched-target count, so its
     # magnitude dropped roughly 10x. This weight was re-tuned accordingly.
     cls_loss_weight = 2.0          # Classification loss weight (1.0-5.0)
-    aux_loss_weight = 0            # Auxiliary loss weight (0.2-0.6, 0 to disable)
+    # Was 0, which routed through `if aux_loss_weight <= 0: num_aux_layers = 0`
+    # below and disabled the auxiliary heads entirely - 6 decoder layers with
+    # supervision on the last one only. Re-enabled at the DETR-ish default.
+    # NOTE: this makes aux_rematch live for the first time (2 extra Hungarian
+    # matchings per step), so expect epoch time to rise above the 40.7 min
+    # baseline measured while the aux path was dead.
+    aux_loss_weight = 0.4          # Auxiliary loss weight (0.2-0.6, 0 to disable)
     eos_coef = 0.1                 # Background class weight in cls loss (DETR default)
     enc_loss_weight = 1.0          # Encoder objectness loss (trains Mixed Query Selection)
 
@@ -512,6 +611,15 @@ def main():
     save_dir = 'runs'             # Checkpoint save directory
     resume_training = True        # Resume from latest checkpoint
     weights_path = 'weights/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth'
+    # Checkpoints written before loss_semantics_version existed carry no record
+    # of which bbox convention their weights use. Version 2 stored ABSOLUTE
+    # coordinates; version 3 onward stores an offset from the query's reference
+    # point. The tensor shapes are identical, so loading the wrong one succeeds
+    # silently and every predicted box is wrong. Resuming such a checkpoint
+    # therefore requires saying out loud which convention it uses.
+    #   None -> refuse to resume an unversioned checkpoint (default)
+    #   int  -> assert it was written under that loss_semantics_version
+    assume_loss_semantics_version = None
 
     # === Experiment Tracking ===
     use_mlflow = True              # False to skip MLflow (JSON manifests stay on)
@@ -612,6 +720,82 @@ def main():
         except Exception as e:
             print(f"weights_only=True load failed ({type(e).__name__}), retrying: {e}")
             checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+
+        # Establish which bbox convention these weights use BEFORE loading them.
+        # bbox_head has the same shape under every version, so a mismatch does
+        # not raise - it just makes every box wrong. Falls back to the sibling
+        # manifest, which has recorded the version since before the checkpoint
+        # itself did.
+        ckpt_version = checkpoint.get('loss_semantics_version')
+        version_source = 'checkpoint'
+        if ckpt_version is None:
+            manifest_path = os.path.splitext(checkpoint_path)[0] + '.json'
+            try:
+                with open(manifest_path) as fh:
+                    manifest = json.load(fh)
+                # A malformed manifest must fall through to the refusal below,
+                # not crash. `except ValueError` covers unparseable JSON, but a
+                # well-formed non-object ("[]", "42") parses fine and would then
+                # raise AttributeError on .get().
+                if isinstance(manifest, dict):
+                    ckpt_version = manifest.get('loss_semantics_version')
+                    if ckpt_version is not None:
+                        version_source = f'manifest ({os.path.basename(manifest_path)})'
+                else:
+                    print(f"Ignoring {manifest_path}: expected a JSON object, "
+                          f"got {type(manifest).__name__}")
+            except (OSError, ValueError):
+                pass
+        # Validate the VALUE, not just the manifest's container type. A manifest
+        # reading {"loss_semantics_version": "4"} parses fine and survives the
+        # isinstance(dict) check above, then raises
+        #   TypeError: '<' not supported between instances of 'str' and 'int'
+        # at the `< 3` comparison below - a crash instead of the refusal path
+        # that exists precisely for unusable version information. Discarding it
+        # here also lets assume_loss_semantics_version rescue the run.
+        # bool is excluded explicitly: it passes isinstance(x, int) and True < 3
+        # would silently evaluate as 1 < 3.
+        if ckpt_version is not None and (not isinstance(ckpt_version, int)
+                                         or isinstance(ckpt_version, bool)):
+            print(f"Ignoring loss_semantics_version {ckpt_version!r} from "
+                  f"{version_source}: expected an int, got "
+                  f"{type(ckpt_version).__name__}")
+            ckpt_version = None
+
+        if ckpt_version is None and assume_loss_semantics_version is not None:
+            ckpt_version = assume_loss_semantics_version
+            version_source = 'assume_loss_semantics_version'
+
+        if ckpt_version is None:
+            print(f"Error: {checkpoint_path} records no loss_semantics_version, "
+                  f"and no manifest was found beside it.")
+            print("  Version 2 checkpoints store ABSOLUTE box coordinates; version 3+")
+            print("  store an offset from the query's reference point. The shapes match,")
+            print("  so loading the wrong one is silent and every box comes out wrong.")
+            print("  Set assume_loss_semantics_version in the config to the version this")
+            print("  checkpoint was trained under, or start from scratch.")
+            # Not `return`: a plain return leaves the process at exit code 0, and
+            # a background runner would file "never started training" as success.
+            # This is a refusal, unlike the "already at target epoch" paths above.
+            sys.exit(1)
+        if ckpt_version < 3:
+            print(f"Error: {checkpoint_path} is loss_semantics_version {ckpt_version} "
+                  f"(source: {version_source}).")
+            print("  Its bbox_head predicts absolute coordinates, which this model no")
+            print("  longer interprets that way. The weights are not convertible.")
+            print("  Train from scratch instead.")
+            sys.exit(1)
+        print(f"Checkpoint loss_semantics_version: {ckpt_version} (source: {version_source})")
+
+        # Write the resolved version back. train_detection_model() re-reads this
+        # key off the checkpoint to decide whether the early-stopping bookkeeping
+        # is on the current loss scale, and it has no access to the manifest or
+        # to assume_loss_semantics_version. Without this the two fallbacks are
+        # dead weight: a checkpoint whose manifest says v4 would still look
+        # unversioned there, and the mismatch branch would wipe best_val_loss,
+        # best_val_acc and the scheduler state - overwriting a perfectly good
+        # best model on the first epoch.
+        checkpoint['loss_semantics_version'] = ckpt_version
 
         try:
             model.patch_proj.load_state_dict(checkpoint['patch_proj'])

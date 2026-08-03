@@ -63,6 +63,14 @@ DETR architecture based on DINOv3 Backbone.
                  num_encoder_layers=2, num_decoder_layers=4, num_aux_layers=2):
         """
         Args:
+            num_classes: Kept as a parameter for readability, but in practice the
+                only workable value is coco_dataset.COCO_NUM_CLASSES (91).
+                Targets are raw COCO category_ids, model_loader.py and
+                eval_coco.py rebuild at 91, and DetectionLoss rejects anything
+                else outright. This class does not enforce it - doing so would
+                pull a COCO-specific import into an otherwise dataset-agnostic
+                module - so the check lives in DetectionLoss, which is built
+                before the first batch either way.
             num_aux_layers: How many intermediate decoder layers produce auxiliary
                 predictions (the final layer is excluded, it is the main output).
                 Set to 0 to skip the extra head evaluations entirely.
@@ -131,6 +139,18 @@ DETR architecture based on DINOv3 Backbone.
             nn.ReLU(),
             nn.Linear(128, 4)
         )
+
+        # The centre is anchored to the source patch (see _predict_boxes) but w/h
+        # are free, so at default init they come out of sigmoid(~0) = 0.5: every
+        # query proposes a box covering ~25% of the image. Measured over a random
+        # init: w mean 0.513, h mean 0.481, area fraction 0.247.
+        #
+        # That start is close to a large object (w~0.25, logit -1.1) and far from
+        # a small one (w~0.05, logit -2.9), and sigmoid' at 0.05 is 0.19x its
+        # value at 0.5 - so small boxes have three times further to travel with a
+        # fifth of the gradient. sigmoid(-2.0) = 0.12 sits near the median COCO
+        # box instead of near the largest.
+        nn.init.constant_(self.bbox_head[-1].bias[2:], -2.0)
 
     def _predict_boxes(self, features, reference_logits):
         """

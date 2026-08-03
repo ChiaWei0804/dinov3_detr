@@ -28,7 +28,8 @@ from pycocotools.cocoeval import COCOeval
 # 引入您專案中的模組
 from dinov3_detection_model import DINOv3DetectionModel
 import coco_dataset
-from coco_dataset import decode_class_predictions, VALID_COCO_CATEGORY_IDS
+from coco_dataset import (decode_class_predictions, VALID_COCO_CATEGORY_IDS,
+                          COCO_NUM_CLASSES)
 
 # 設置設備
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -210,7 +211,7 @@ def main():
     # 根據偵測到的配置初始化模型
     # num_aux_layers=0：推論不需要中間層的輔助預測，省去多餘的 head 計算
     model = DINOv3DetectionModel(
-        num_classes=91,
+        num_classes=COCO_NUM_CLASSES,
         num_queries=num_q,
         num_encoder_layers=num_enc,
         num_decoder_layers=num_dec,

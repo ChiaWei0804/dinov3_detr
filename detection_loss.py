@@ -13,9 +13,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from scipy.optimize import linear_sum_assignment
-from coco_dataset import BACKGROUND_CLASS_INDEX
-from iou_utils import (calculate_iou_batch_cxcywh, calculate_iou_pairwise_cxcywh,
-                       _safe_iou, _promote)
+from coco_dataset import (BACKGROUND_CLASS_INDEX, VALID_COCO_CATEGORY_IDS,
+                          COCO_NUM_CLASSES)
+from iou_utils import calculate_iou_batch_cxcywh, _safe_iou, _promote
 
 
 def complete_box_iou(boxes1, boxes2):
@@ -136,9 +136,9 @@ class DetectionLoss(nn.Module):
     This keeps GPU utilization high and avoids CPU bottlenecks.
     """
     def __init__(self, bbox_loss_weight=5.0, ciou_loss_weight=5.0, cls_loss_weight=2.0,
-                 num_classes=91, num_queries=100, max_targets_per_image=100,
+                 num_classes=COCO_NUM_CLASSES, num_queries=100, max_targets_per_image=100,
                  aux_loss_weight=0.4, eos_coef=0.1, enc_loss_weight=1.0,
-                 aux_rematch=True):
+                 aux_rematch=True, enc_center_radius=1):
         """
         Initialize detection loss function.
 
@@ -155,6 +155,11 @@ class DetectionLoss(nn.Module):
                 without this the background term drowns out the foreground term.
             enc_loss_weight: Weight of the encoder objectness loss that supervises
                 Mixed Query Selection (default: 1.0)
+            enc_center_radius: Half-width, in patches, of the positive block the
+                encoder objectness loss places on each GT centre (default: 1,
+                i.e. 3x3). The block is clipped to the GT box, so this is an
+                upper bound. Larger values re-introduce the area bias that lets
+                one big object monopolise the top-K query budget.
             aux_rematch: Run Hungarian matching separately for every auxiliary
                 head (default: True, which is what DETR does). Reusing the final
                 layer's assignment is cheaper - one matching per step instead of
@@ -171,7 +176,44 @@ class DetectionLoss(nn.Module):
         self.max_targets_per_image = max_targets_per_image
         self.aux_loss_weight = aux_loss_weight
         self.enc_loss_weight = enc_loss_weight
+        self.eos_coef = eos_coef
         self.aux_rematch = aux_rematch
+        # Validate here rather than letting it fail inside the loss: a bad radius
+        # survives construction and only blows up on the first batch that
+        # contains a GT - minutes into a run - as `IndexError: tensors used as
+        # indices must be long...` (float radius) or a torch.arange RuntimeError
+        # (negative radius), neither of which names the parameter at fault.
+        if not isinstance(enc_center_radius, int) or isinstance(enc_center_radius, bool):
+            raise TypeError(
+                f"enc_center_radius must be an int, got "
+                f"{type(enc_center_radius).__name__}: {enc_center_radius!r}")
+        if enc_center_radius < 0:
+            raise ValueError(
+                f"enc_center_radius must be >= 0, got {enc_center_radius}. "
+                f"0 marks only each GT's centre patch; 1 (default) a 3x3 block.")
+        self.enc_center_radius = enc_center_radius
+
+        # cross_entropy indexes the logits with the raw COCO category_id, so the
+        # head must have a column for the LARGEST id (90), not for the 80 ids
+        # that actually exist. Configuring num_classes=80 looks reasonable and
+        # fails at the first annotation with category_id > 80, several minutes
+        # into a run, as `IndexError: Target 90 is out of bounds`.
+        # Reject on inequality, not on "< 90". 90 avoids the IndexError but still
+        # builds a 91-column cls_head that model_loader.py cannot load, and 92+
+        # is wrong in the other direction - so the only correct test is equality
+        # against the single value every builder shares.
+        if num_classes != COCO_NUM_CLASSES:
+            max_category_id = max(VALID_COCO_CATEGORY_IDS)
+            reason = (f"below {max_category_id}, so cross_entropy would index "
+                      f"out of bounds on a raw COCO category_id"
+                      if num_classes < max_category_id else
+                      f"not the value model_loader.py and eval_coco.py rebuild "
+                      f"the model with, so the checkpoint would fail to load")
+            raise ValueError(
+                f"num_classes={num_classes} is invalid: it is {reason}. Use "
+                f"coco_dataset.COCO_NUM_CLASSES ({COCO_NUM_CLASSES}). The "
+                f"unused ids in 1..{COCO_NUM_CLASSES} stay as dead columns; "
+                f"decode_class_predictions masks them out.")
 
         # Use L1 Loss, reduction='none'
         self.l1_loss = nn.L1Loss(reduction='none')
@@ -180,6 +222,41 @@ class DetectionLoss(nn.Module):
         empty_weight = torch.ones(num_classes + 1)
         empty_weight[BACKGROUND_CLASS_INDEX] = eos_coef
         self.register_buffer('empty_weight', empty_weight)
+
+    def loss_scale_signature(self):
+        """
+        Every setting that moves the MAGNITUDE of the returned loss.
+
+        LOSS_SEMANTICS_VERSION covers changes to what the loss MEANS, but it is a
+        hand-maintained constant: flipping aux_loss_weight from 0.4 to 0 shifts
+        total loss to 0.72x of its former value while the version stays put, and
+        a resumed run would read the smaller number as an improvement and
+        overwrite a genuinely better best model on its first epoch. Comparing
+        this signature catches the configuration half automatically; the version
+        constant still covers the code half.
+
+        eos_coef is included even though it only reweights the classification
+        term, and enc_center_radius because it changes how many positives the
+        encoder objectness BCE sees.
+
+        num_queries is here despite being a MODEL parameter rather than a loss
+        one: the classification term is a weighted mean over every query, so
+        adding queries without adding GT raises the share of background targets
+        and moves the mean. Measured at 100 -> 300 queries with everything else
+        held constant: total 17.39 -> 19.47 (1.12x). The state dict loads clean
+        across that change - the heads do not depend on the query count - so
+        nothing else would catch it.
+        """
+        return {
+            'num_queries': int(self.num_queries),
+            'bbox_loss_weight': float(self.bbox_loss_weight),
+            'ciou_loss_weight': float(self.ciou_loss_weight),
+            'cls_loss_weight': float(self.cls_loss_weight),
+            'aux_loss_weight': float(self.aux_loss_weight),
+            'enc_loss_weight': float(self.enc_loss_weight),
+            'eos_coef': float(self.eos_coef),
+            'enc_center_radius': int(self.enc_center_radius),
+        }
 
     def calculate_iou_batch(self, boxes1, boxes2):
         """Calculate IoU batch matrix using unified iou_utils module"""
@@ -381,7 +458,20 @@ class DetectionLoss(nn.Module):
         `topk_score_head` never receives a gradient and query selection stays
         frozen at its random initialisation.
 
-        Target: 1 for every patch whose centre falls inside at least one GT box.
+        Target: a small block of patches centred on each GT's centre patch,
+        clipped to the GT box.
+
+        NOT "every patch whose centre falls inside a GT box". That coverage-mask
+        formulation makes the number of positives proportional to object AREA,
+        which is what Mixed Query Selection then spends its query budget on. On a
+        50x50 grid one object of 0.5x0.6 supplies 780 of the 2500 patches, so
+        torch.topk(100) can legitimately place every single query inside it,
+        while eight small objects supply 58 patches between them. Measured
+        symptom: AR@10=0.364 -> AR@100=0.387, i.e. 90 extra detections buy 0.023
+        because they are duplicates of the same few large objects.
+
+        Capping each GT at a fixed-size block makes the budget per object roughly
+        equal regardless of size, so top-K has to spread out to keep scoring.
 
         Args:
             enc_logits: Tensor [B, num_patches] raw objectness logits
@@ -395,17 +485,10 @@ class DetectionLoss(nn.Module):
         device = enc_logits.device
         h, w = grid_hw
 
-        # Normalized centre coordinate of every patch, flattened row-major to
-        # match the token order coming out of the ViT.
-        ys = (torch.arange(h, device=device, dtype=torch.float32) + 0.5) / h
-        xs = (torch.arange(w, device=device, dtype=torch.float32) + 0.5) / w
-        centre_y = ys.view(h, 1).expand(h, w).reshape(-1)  # [h*w]
-        centre_x = xs.view(1, w).expand(h, w).reshape(-1)  # [h*w]
-
-        # Vectorised over the whole batch: every GT box in the batch is tested
-        # against every patch centre at once, then scattered back to its image.
-        # Looping per image instead costs a dozen kernel launches per image on
-        # tiny tensors, which on Windows dominates the actual arithmetic.
+        # Vectorised over the whole batch: every GT contributes its block in one
+        # set of ops, then the blocks are scattered back to their image. Looping
+        # per image instead costs a dozen kernel launches per image on tiny
+        # tensors, which on Windows dominates the actual arithmetic.
         targets = torch.zeros(enc_logits.shape, device=device, dtype=torch.float32)
         if flat_boxes.numel() > 0:
             boxes = flat_boxes.float()                            # [G, 4] cxcywh
@@ -414,12 +497,36 @@ class DetectionLoss(nn.Module):
             x2 = (boxes[:, 0] + boxes[:, 2] * 0.5).unsqueeze(1)
             y2 = (boxes[:, 1] + boxes[:, 3] * 0.5).unsqueeze(1)
 
-            inside = ((centre_x.unsqueeze(0) >= x1) & (centre_x.unsqueeze(0) <= x2) &
-                      (centre_y.unsqueeze(0) >= y1) & (centre_y.unsqueeze(0) <= y2))
+            # Patch containing each GT centre. clamp guards centres that land
+            # exactly on the far edge (cx == 1.0 would index w).
+            gx = (boxes[:, 0] * w).long().clamp(0, w - 1)         # [G]
+            gy = (boxes[:, 1] * h).long().clamp(0, h - 1)         # [G]
 
-            # index_add_ accumulates per image; any positive count means "covered"
-            targets.index_add_(0, gt_batch_ids, inside.float())
-            targets = (targets > 0).float()
+            r = self.enc_center_radius
+            offs = torch.arange(-r, r + 1, device=device)
+            dy, dx = torch.meshgrid(offs, offs, indexing='ij')
+            dy, dx = dy.reshape(1, -1), dx.reshape(1, -1)         # [1, K]
+
+            ny = (gy.unsqueeze(1) + dy).clamp(0, h - 1)           # [G, K]
+            nx = (gx.unsqueeze(1) + dx).clamp(0, w - 1)           # [G, K]
+            flat_idx = ny * w + nx                                # [G, K] row-major
+
+            # Clip the block to the box so a small object does not claim patches
+            # outside itself. The clamps above can also fold two offsets onto the
+            # same patch at the grid edge; assigning 1.0 is idempotent so the
+            # duplicates are harmless.
+            pc_x = (nx.float() + 0.5) / w
+            pc_y = (ny.float() + 0.5) / h
+            inside = ((pc_x >= x1) & (pc_x <= x2) &
+                      (pc_y >= y1) & (pc_y <= y2))                # [G, K]
+
+            # A box smaller than one patch can have NO patch centre inside it,
+            # which would leave that object with zero positives and no way to
+            # ever be selected. Force its own centre patch on.
+            inside[:, offs.numel() ** 2 // 2] = True
+
+            img_idx = gt_batch_ids.unsqueeze(1).expand_as(flat_idx)  # [G, K]
+            targets[img_idx[inside], flat_idx[inside]] = 1.0
 
         # Object patches are a small minority; rebalance so they are not ignored.
         num_pos = targets.sum().clamp(min=1.0)
@@ -427,7 +534,13 @@ class DetectionLoss(nn.Module):
         # The lower clamp matters: with no negatives at all (a GT box covering the
         # whole grid) the ratio is 0, which zeroes every positive term and leaves
         # topk_score_head with no gradient for that step. Fall back to unweighted.
-        pos_weight = (num_neg / num_pos).clamp(min=1.0, max=100.0)
+        #
+        # The upper clamp was 100, chosen when the target was a coverage mask and
+        # positives were plentiful (hundreds per image). Centre blocks make them
+        # ~10x sparser - a single-object image now sits near 2491/9 = 277 - so 100
+        # would clip the rebalancing it exists to provide on exactly the sparse
+        # images that need it most.
+        pos_weight = (num_neg / num_pos).clamp(min=1.0, max=400.0)
 
         return F.binary_cross_entropy_with_logits(
             enc_logits.float(), targets, pos_weight=pos_weight
@@ -467,9 +580,24 @@ class DetectionLoss(nn.Module):
         gt_expanded = flat_boxes.unsqueeze(1)                      # [G, 1, 4]
 
         l1_cost = torch.abs(pred_per_gt - gt_expanded).sum(dim=-1)             # [G, Q]
-        iou_cost = 1.0 - calculate_iou_pairwise_cxcywh(pred_per_gt, gt_expanded)
 
-        cost = cls_cost + 5.0 * (l1_cost + iou_cost)               # [G, Q]
+        # CIoU, not plain IoU: this term is weighted by ciou_loss_weight and must
+        # therefore BE the quantity that weight trains. The two disagree in
+        # practice - for GT [0.5,0.5,0.4,0.4], predictions [0.3,0.3,0.3,0.7] and
+        # [0.3,0.5,0.2,0.8] rank 0.165 > 0.143 under IoU but 0.069 < 0.084 under
+        # CIoU - so matching on IoU hands the GT to the query the loss then has
+        # to correct hardest.
+        ciou_cost = 1.0 - complete_box_iou(pred_per_gt, gt_expanded)           # [G, Q]
+
+        # The matching criterion must be the loss it feeds. The hardcoded 5.0 on
+        # both box terms meant the assignment was chosen under cls:L1:IoU =
+        # 1:5:5 while _compute_loss_fast then trained it under 1:4:1 (the
+        # configured 2.0/8.0/2.0) - so IoU drove which query owned a GT but
+        # barely drove how that query was corrected afterwards. DETR keeps the
+        # two identical for exactly this reason.
+        cost = (self.cls_loss_weight * cls_cost
+                + self.bbox_loss_weight * l1_cost
+                + self.ciou_loss_weight * ciou_cost)               # [G, Q]
 
         # ONE transfer; transpose to [Q, G] so each image is a contiguous slice
         merged = _sanitize_cost_matrix(cost.transpose(0, 1))

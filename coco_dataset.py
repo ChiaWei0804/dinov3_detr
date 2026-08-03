@@ -68,11 +68,42 @@ for invalid_id in non_existent_ids:
 # land on one of the 10 gaps in the 1..90 id range.
 VALID_COCO_CATEGORY_IDS = frozenset(COCO_ID_TO_CONTINUOUS_ID.keys())
 
+# The one num_classes value this project is allowed to use.
+#
+# Targets are raw COCO category_ids, so the head must have a column for the
+# LARGEST id (90) - hence 90 is the smallest value that avoids an IndexError in
+# cross_entropy. But 90 is NOT a safe choice: it produces a 91-column cls_head,
+# while model_loader.py and eval_coco.py rebuild the model at 91 (92 columns),
+# and load_state_dict then fails with
+#     size mismatch for bias: copying a param with shape [91] ...
+# Anything other than exactly this value produces a checkpoint some part of the
+# project cannot load, so every builder imports it from here rather than
+# hardcoding a literal.
+COCO_NUM_CLASSES = 91
+
 # Class index used for "no object". The model outputs num_classes+1 logits where
 # index 0 is background and indices 1..90 are raw COCO category_ids, so the
 # background column is the FIRST one, not the last. Every consumer of the class
 # logits must agree with DetectionLoss on this.
 BACKGROUND_CLASS_INDEX = 0
+
+
+# Cache of foreground validity masks, keyed by (num_foreground_columns, device,
+# dtype). Rebuilding the mask per call would put a host-to-device copy inside the
+# inference loop.
+_FOREGROUND_MASK_CACHE = {}
+
+
+def _foreground_validity_mask(num_fg, device, dtype):
+    """Boolean mask over foreground columns: True where the column is a real COCO id."""
+    key = (num_fg, device, dtype)
+    mask = _FOREGROUND_MASK_CACHE.get(key)
+    if mask is None:
+        ids = torch.arange(1, num_fg + 1)
+        mask = torch.tensor([int(i) in VALID_COCO_CATEGORY_IDS for i in ids],
+                            device=device, dtype=torch.bool)
+        _FOREGROUND_MASK_CACHE[key] = mask
+    return mask
 
 
 def decode_class_predictions(pred_logits):
@@ -83,6 +114,21 @@ def decode_class_predictions(pred_logits):
     Slicing with [..., :-1] would instead drop the never-trained last column and
     leave background in the argmax, which silently suppresses most detections.
 
+    Columns that do not correspond to a real COCO id are masked out before the
+    argmax. With num_classes=91 there are 11 such columns - the 10 gaps in
+    1..90 plus column 91, which exists only because the head is sized
+    num_classes+1 - and none of them is ever a training target. They are pushed
+    down by cross_entropy but can still win an argmax, and a query whose argmax
+    lands on one is discarded outright: eval_coco.py filters it against
+    VALID_COCO_CATEGORY_IDS and calculate_validation_metrics can never match its
+    class. Masking makes that query fall back to its best VALID class instead of
+    being thrown away.
+
+    The mask is applied to probabilities rather than logits so the returned score
+    stays the true softmax probability of the chosen class - zeroing a column
+    after softmax removes it from the argmax without redistributing its mass onto
+    the survivors.
+
     Args:
         pred_logits: Tensor [..., num_classes + 1] of raw (pre-softmax) logits
 
@@ -91,7 +137,10 @@ def decode_class_predictions(pred_logits):
         labels: Tensor [...] corresponding COCO category_id (1-based)
     """
     prob = pred_logits.softmax(-1)
-    scores, labels = prob[..., 1:].max(-1)
+    fg = prob[..., 1:]
+    valid = _foreground_validity_mask(fg.shape[-1], fg.device, fg.dtype)
+    fg = fg.masked_fill(~valid, 0.0)
+    scores, labels = fg.max(-1)
     return scores, labels + 1
 
 
