@@ -328,7 +328,11 @@ def _sample_crop(orig_w, orig_h, canvas_ar):
     Starts from the largest rectangle of that aspect that fits inside the image,
     scales it by a random factor and places it at random.
 
-    Returns (x0, y0, width, height) in original pixels.
+    Returns (x0, y0, width, height) in original pixels, all INTEGER. Pillow
+    rounds a float crop box to whole pixels, so a fractional rect would hand
+    back an image whose real size differs from the width and height the boxes
+    are then normalized against. Measured worst case 0.6px, i.e. 0.2% of a
+    300px frame or 0.11 of a patch - small, but free to remove.
     """
     if orig_w / orig_h > canvas_ar:
         max_h = float(orig_h)
@@ -340,10 +344,15 @@ def _sample_crop(orig_w, orig_h, canvas_ar):
     # torch's RNG is re-seeded per DataLoader worker, python's `random` is not
     # guaranteed to be, so every draw here comes from torch.
     scale = CROP_MIN_SCALE + (CROP_MAX_SCALE - CROP_MIN_SCALE) * float(torch.rand(()))
-    crop_w = max(1.0, min(float(orig_w), max_w * scale))
-    crop_h = max(1.0, min(float(orig_h), max_h * scale))
-    x0 = float(torch.rand(())) * (orig_w - crop_w)
-    y0 = float(torch.rand(())) * (orig_h - crop_h)
+    crop_w = int(max(1.0, min(float(orig_w), max_w * scale)))
+    crop_h = int(max(1.0, min(float(orig_h), max_h * scale)))
+    # There are span+1 legal starts for a span of orig_w - crop_w, so the draw
+    # spans span+1 values: rand() is [0, 1), so int(rand * (span + 1)) covers
+    # 0..span inclusive and x0 + crop_w <= orig_w still holds. Multiplying by
+    # span alone would stop at span-1 and never place the crop flush against the
+    # right or bottom edge - invisible at span 240, total at span 1.
+    x0 = int(float(torch.rand(())) * (orig_w - crop_w + 1))
+    y0 = int(float(torch.rand(())) * (orig_h - crop_h + 1))
     return x0, y0, crop_w, crop_h
 
 

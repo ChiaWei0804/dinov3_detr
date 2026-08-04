@@ -14,6 +14,7 @@ import cv2
 import time
 
 from iou_utils import calculate_iou_xyxy
+import coco_dataset
 from coco_dataset import (COCO_CLASSES, MODEL_OUTPUT_TO_COCO_ID, decode_class_predictions,
                           INPUT_RESOLUTION)
 from model_loader import load_detection_model
@@ -67,24 +68,22 @@ def print_memory_summary(stage=""):
 DEFAULT_WEIGHTS_PATH = 'weights/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth'
 
 
-# Resolution comes from coco_dataset so training and inference cannot drift apart.
+# Canvas comes from coco_dataset so training and inference cannot drift apart.
+# Training no longer resizes to a square: an image goes to one of three
+# aspect-ratio buckets, so inference has to pick the same canvas per image or it
+# feeds the model a geometry it was never trained on. Kept as the square canvas
+# only for postprocess_detections' signature, which ignores the value.
 MODEL_INPUT_SIZE = (INPUT_RESOLUTION, INPUT_RESOLUTION)
 
 
 def preprocess_image(image_path):
-    """Preprocess the input image to the training resolution"""
-    transform = transforms.Compose([
-        transforms.Resize(MODEL_INPUT_SIZE),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                             std=[0.229, 0.224, 0.225])
-    ])
-
+    """Preprocess the input image onto its aspect bucket's canvas"""
     image = Image.open(image_path).convert('RGB')
     original_size = image.size
 
-    processed_image = transform(image).unsqueeze(0)
-    return processed_image, image, original_size, MODEL_INPUT_SIZE
+    canvas = coco_dataset.canvas_for_size(*original_size)
+    processed_image = coco_dataset.transform_for_canvas(canvas)(image).unsqueeze(0)
+    return processed_image, image, original_size, canvas
 
 
 def preprocess_frame(frame):
@@ -94,12 +93,10 @@ def preprocess_frame(frame):
     original_h, original_w = frame.shape[:2]
     original_size = (original_w, original_h)
 
+    canvas = coco_dataset.canvas_for_size(original_w, original_h)
     transform = transforms.Compose([
         transforms.ToPILImage(),
-        transforms.Resize(MODEL_INPUT_SIZE),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                             std=[0.229, 0.224, 0.225])
+        coco_dataset.transform_for_canvas(canvas),
     ])
 
     processed_image = transform(frame_rgb).unsqueeze(0)
@@ -825,15 +822,25 @@ if __name__ == '__main__':
                        help='BBox 線條寬度 (default: 1)')
     parser.add_argument('--fontsize', type=float, default=6,
                        help='Label 字體大小 (default: 6)')
-    
-    
+    # 與 eval_coco.py 一致。沒有這個旗標時，另開一個程序跑 test.py 只會拿到
+    # coco_dataset 的模組預設值，訓練若用了別的解析度就會靜默錯配：訓練
+    # input_resolution=640 的 landscape 畫布是 736×544，推論卻送 912×688。
+    parser.add_argument('--resolution', type=int,
+                       default=coco_dataset.DEFAULT_INPUT_RESOLUTION,
+                       help='輸入解析度，必須與訓練時一致 (default: 800)')
+
+
     args = parser.parse_args()
-    
+
+    # 必須在任何 preprocess / transform 之前設定
+    coco_dataset.set_input_resolution(args.resolution)
+
     print("=" * 80)
     print("DINOv3 物件檢測測試工具 - 多源支持")
     print("=" * 80)
     print(f"\n配置:")
     print(f"  模型路徑: {args.model}")
+    print(f"  輸入解析度: {args.resolution} (square bucket 邊長)")
     print(f"  置信度閾值: {args.threshold}")
     print(f"  NMS 閾值: {args.nms}")
     print(f"  BBox 線寬: {args.linewidth}")

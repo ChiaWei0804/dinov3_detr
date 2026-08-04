@@ -360,6 +360,11 @@ def train_detection_model(model, train_loader, val_loader, num_epochs=10, start_
     train_losses = []
     val_losses = []
     val_accuracies = []
+    # Seeded from the scheduler's opening rates so the return is well-defined
+    # even if the loop body never runs; every epoch overwrites it.
+    final_lrs = {'encoder': optimizer.param_groups[0]['lr'],
+                 'backbone': optimizer.param_groups[1]['lr'],
+                 'decoder': optimizer.param_groups[2]['lr']}
 
     print(f"Training from epoch {start_epoch+1} to {start_epoch+num_epochs}...")
     print(f"Saving checkpoints to: {save_dir}/")
@@ -482,6 +487,12 @@ def train_detection_model(model, train_loader, val_loader, num_epochs=10, start_
             'recall_iou05': recall_iou05, 'avg_max_iou': avg_max_iou,
         }
         epoch_lrs = {'encoder': encoder_lr, 'backbone': backbone_lr, 'decoder': decoder_lr}
+        # Captured here, not after the loop: scheduler.step() at the bottom of
+        # the body advances to the NEXT epoch's rates, so reading param_groups
+        # once training is over reports an epoch that never ran. It also differs
+        # between the two ways out of the loop - early stopping breaks before the
+        # step, running out of epochs does not.
+        final_lrs = dict(epoch_lrs)
         architecture = {
             'num_classes': loss_fn.num_classes,
             'num_queries': model.num_queries,
@@ -552,7 +563,14 @@ def train_detection_model(model, train_loader, val_loader, num_epochs=10, start_
     # best_val_loss / best_val_acc are returned rather than recomputed by the
     # caller: they span the whole run (seeded from the checkpoint on resume),
     # whereas val_losses/val_accuracies only cover the epochs of THIS segment.
-    return model, train_losses, val_losses, val_accuracies, best_val_loss, best_val_acc
+    #
+    # final_lrs likewise: the caller only has the CONFIGURED bases, and under a
+    # cosine schedule the last epoch trains at a small fraction of them - 1.03e-6
+    # against a configured 1e-4 over 100 epochs - so a manifest built from the
+    # config misreports the final state by two orders of magnitude. It is filled
+    # in inside the loop, before the scheduler advances.
+    return (model, train_losses, val_losses, val_accuracies,
+            best_val_loss, best_val_acc, final_lrs)
 
 
 
@@ -904,7 +922,7 @@ def main():
     )
 
     (trained_model, train_losses, val_losses, val_accuracies,
-     best_val_loss, best_val_acc) = train_detection_model(
+     best_val_loss, best_val_acc, final_lrs) = train_detection_model(
         model,
         train_loader,
         val_loader,
@@ -960,7 +978,7 @@ def main():
             final_path, start_epoch + len(val_losses) - 1,
             {'loss': train_losses[-1]},
             {'loss': val_losses[-1], 'recall_iou05': val_accuracies[-1]},
-            {'encoder': encoder_target_lr, 'backbone': backbone_lr, 'decoder': decoder_lr},
+            final_lrs,
             best_val_loss, best_val_acc, 0,
             architecture={
                 'num_classes': num_classes,
