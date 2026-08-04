@@ -34,36 +34,30 @@ from coco_dataset import (decode_class_predictions, VALID_COCO_CATEGORY_IDS,
 # 設置設備
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+# COCOeval 的 maxDets 上限就是 100，送出更多也不會被計分。
+MAX_DETECTIONS_PER_IMAGE = 100
+
 class COCOEvalDataset(CocoDetection):
-    def __init__(self, root, annFile, transform=None):
+    def __init__(self, root, annFile):
         # [修正 1] 傳遞 transform=None 給父類別
         # 這樣 super().__getitem__ 才會回傳原始的 PIL 圖片，而不是處理後的 Tensor
         super().__init__(root, annFile, transform=None)
-        
-        # [修正 2] 將 transform 存在自己的屬性中，稍後手動呼叫
-        #
-        # transform=None 時 __getitem__ 會原樣回傳 PIL Image，而 collate_fn_eval
-        # 直接對它做 torch.stack，會在建立 DataLoader 之後才以 TypeError 爆掉。
-        # 與其讓它拖到那時候，不如在這裡就講清楚。
-        if transform is None:
-            raise ValueError(
-                "COCOEvalDataset 需要一個 transform（例如 coco_dataset 的 "
-                "global_val_transform）。transform=None 會讓 __getitem__ 回傳 "
-                "PIL Image，collate 階段的 torch.stack 必然失敗。")
-        self.eval_transform = transform
 
     def __getitem__(self, index):
         # 1. 取得原始 PIL 圖片 (因為父類別 transform 為 None)
         img, target = super().__getitem__(index)
-        
+
         # 2. 正確獲取原始尺寸 (PIL Image 的 .size 是屬性，回傳 (w, h))
         orig_w, orig_h = img.size
-        
+
         image_id = self.ids[index]
 
-        # 3. 手動執行預處理 (Resize 512 + Normalize + ToTensor)
-        if self.eval_transform is not None:
-            img = self.eval_transform(img)
+        # 3. 手動執行預處理 (Resize + Normalize + ToTensor)
+        #
+        # 畫布依長寬比分桶選擇，必須與訓練時一致。同一個 batch 內的圖片由
+        # AspectRatioBatchSampler 保證同桶、因而同畫布，collate 的 torch.stack
+        # 才成立。
+        img = coco_dataset.transform_for_size(orig_w, orig_h)(img)
 
         return img, {
             "image_id": image_id,
@@ -109,12 +103,15 @@ def evaluate(model, data_loader, coco_gt, device, output_file='prediction_result
                 img_labels = labels[i]
                 img_boxes = pred_boxes[i] # [cx, cy, w, h] normalized (0-1)
                 
-                # 篩選低置信度預測以加速評估 (通常 0.05 或 0.01)
-                keep = img_scores > 0.05
-                
-                if keep.sum() == 0:
-                    continue
-                
+                # 取分數最高的 100 個，不設信心閾值。
+                #
+                # 原本的 `img_scores > 0.05` 是為了加速，但 COCO AP 的計分方式讓
+                # 保留低分偵測變成純賺：排在後面的 false positive 幾乎不扣分，
+                # 多命中一個就多賺 recall，而 maxDets=100 本來就是上限。DETR 官方
+                # 的 post-process 同樣不設閾值、直接取前 100。
+                keep = img_scores.topk(min(MAX_DETECTIONS_PER_IMAGE,
+                                           img_scores.numel())).indices
+
                 keep_scores = img_scores[keep]
                 keep_labels = img_labels[keep]
                 keep_boxes = img_boxes[keep]
@@ -277,21 +274,25 @@ def main():
     
     model.to(device)
     
-    # 2. 準備數據集 (使用 coco_dataset.py 中的 global_val_transform)
+    # 2. 準備數據集 (畫布與訓練同樣依長寬比分桶)
     print("Preparing dataset...")
     dataset = COCOEvalDataset(
         root=args.val_root,
-        annFile=args.ann_file,
-        # 關鍵：使用專案定義的預處理。以模組屬性讀取，才能取到
-        # set_input_resolution() 之後重建的 transform。
-        transform=coco_dataset.global_val_transform
+        annFile=args.ann_file
     )
-    
+
+    # batch_sampler 保證一個 batch 內的圖片同桶同畫布；沒有它，
+    # collate_fn_eval 的 torch.stack 會在遇到不同畫布時直接爆掉。
+    batch_sampler = coco_dataset.AspectRatioBatchSampler(
+        coco_dataset.bucket_ids_for_dataset(dataset),
+        batch_size=args.batch_size,
+        shuffle=False
+    )
+
     dataloader = DataLoader(
-        dataset, 
-        batch_size=args.batch_size, 
-        shuffle=False, 
-        num_workers=0, 
+        dataset,
+        batch_sampler=batch_sampler,
+        num_workers=0,
         collate_fn=collate_fn_eval,
         pin_memory=True
     )

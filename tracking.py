@@ -52,7 +52,20 @@ import torch
 #           together scale total loss by about 1.5x on identical predictions.
 #       A version-3 best_val_loss is NOT beatable by a version-4 run; see the
 #       resume guard in train.py.
-LOSS_SEMANTICS_VERSION = 4
+#   5 = the inputs changed, not the loss formula, but every recorded number
+#       moves with them:
+#       (a) num_queries 200 -> 100, which halves the background mass in the
+#           query-mean classification loss;
+#       (b) images are resized onto one of three aspect-ratio canvases instead
+#           of a square, so the encoder objectness grid is 57x43 / 50x50 / 43x57
+#           and `enc` is computed over a different number of patches;
+#       (c) training adds scale jitter + random crop, so train loss is measured
+#           on a harder distribution than before (val is unaugmented, but its
+#           canvas changed under (b)).
+#       bbox_head still predicts an offset from the reference point, so version
+#       4 weights load and train on without conversion - only the bookkeeping
+#       thresholds reset.
+LOSS_SEMANTICS_VERSION = 5
 
 # Structure version of the manifest file itself.
 MANIFEST_SCHEMA_VERSION = 1

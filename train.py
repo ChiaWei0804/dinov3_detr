@@ -36,9 +36,10 @@ All checkpoints, best model and final model are saved in runs/ directory.
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch.optim.lr_scheduler import LambdaLR
 from torch.amp import autocast, GradScaler
 import json
+import math
 import os
 import sys
 import traceback
@@ -185,51 +186,24 @@ def train_detection_model(model, train_loader, val_loader, num_epochs=10, start_
 
     # If continuing training, try to load optimizer, scheduler, scaler states
     if resume_checkpoint is not None:
-        # Skip loading optimizer state (Loss function changed - Cls Loss normalization fixed)
-        # This ensures optimizer starts fresh with correct gradient history
-        # Try to load optimizer state, but fail gracefully if architecture changed
-        optimizer_state_loaded = False
+        # Restore AdamW's moment estimates. Fail gracefully rather than abort:
+        # a changed param-group layout makes the state unloadable, and starting
+        # the moments fresh costs a few steps, not the run.
         if 'optimizer' in resume_checkpoint:
             try:
                 optimizer.load_state_dict(resume_checkpoint['optimizer'])
-                optimizer_state_loaded = True
                 print("Optimizer state loaded successfully.")
             except Exception as e:
                 print(f"WARNING: Skipping optimizer state (Architecture mismatch): {e}")
                 print("   Optimizer will start fresh for compatibility")
 
-        # A loaded optimizer state carries whatever LR ReduceLROnPlateau had
-        # settled on. Overwriting it unconditionally threw that away on every
-        # resume: a run that had decayed to 7.5e-5 restarted at 1e-4 while the
-        # scheduler state restored below still believed it was low. Warmup is a
-        # schedule rather than a plateau reduction, so it still wins while it runs.
-        if start_epoch < WARMUP_EPOCHS:
-            warmup_progress = (start_epoch + 1) / WARMUP_EPOCHS
-            current_encoder_lr = ENCODER_WARMUP_LR + (ENCODER_TARGET_LR - ENCODER_WARMUP_LR) * warmup_progress
-            if len(optimizer.param_groups) >= 1:
-                optimizer.param_groups[0]['lr'] = current_encoder_lr
-            print(f"   Encoder LR set to warmup value: {current_encoder_lr:.6f}")
-        elif not optimizer_state_loaded:
-            if len(optimizer.param_groups) >= 1:
-                optimizer.param_groups[0]['lr'] = ENCODER_TARGET_LR
-            print(f"   Encoder LR set to normal value: {ENCODER_TARGET_LR:.6f}")
-        else:
-            print(f"   Encoder LR kept from checkpoint: "
-                  f"{optimizer.param_groups[0]['lr']:.6f}")
+        # Deliberately NOT restoring the LR from the optimizer state here. Under
+        # ReduceLROnPlateau the checkpoint's LR was the only record of how far
+        # the decay had progressed, so it had to be preserved. A cosine schedule
+        # is a closed-form function of the epoch index instead: it is rebuilt
+        # below with last_epoch=start_epoch-1 and recomputes the correct LR from
+        # scratch. Anything written here would just be overwritten.
 
-        # Same reasoning for the other two groups: only impose the configured
-        # values when there was no state to restore them from.
-        if not optimizer_state_loaded:
-            if len(optimizer.param_groups) >= 2:
-                optimizer.param_groups[1]['lr'] = backbone_lr
-            if len(optimizer.param_groups) >= 3:
-                optimizer.param_groups[2]['lr'] = decoder_lr
-
-        encoder_lr = optimizer.param_groups[0]['lr'] if len(optimizer.param_groups) >= 1 else 0.0001
-        backbone_lr = optimizer.param_groups[1]['lr'] if len(optimizer.param_groups) >= 2 else 0.0001
-        decoder_lr = optimizer.param_groups[2]['lr'] if len(optimizer.param_groups) >= 3 else 0.0001
-        print(f"   Current LRs: Encoder={encoder_lr:.6f}, Backbone={backbone_lr:.6f}, Decoder={decoder_lr:.6f}")
-        
         # Load AMP scaler state
         if 'scaler' in resume_checkpoint:
             print("Loading AMP scaler state from checkpoint...")
@@ -239,11 +213,52 @@ def train_detection_model(model, train_loader, val_loader, num_epochs=10, start_
             except Exception as e:
                 print(f"Failed to load scaler state: {e}")
     
-    # Use ReduceLROnPlateau Scheduler (more suitable for object detection tasks)
-    # patience=3: reduce LR if no improvement for 3 epochs
-    # factor=0.75: reduce LR by 25% (gentler than 0.5, better for low initial LR)
-    print(f"Using ReduceLROnPlateau Scheduler with patience=3, factor=0.75")
-    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.75, patience=3, min_lr=1e-6)
+    # Cosine decay over the WHOLE run, replacing ReduceLROnPlateau(patience=3,
+    # factor=0.75). Measured over the 50-epoch run that produced AP 0.398: the
+    # plateau scheduler fired exactly once in 50 epochs, at epoch 46, because
+    # val loss is noisy enough that a new low kept landing before the counter
+    # reached 3. Epochs 21-45 sat at the full 1e-4 and moved recall 76.12% ->
+    # 76.54% (+0.42pt in 25 epochs); the single 25% cut then moved it to 77.83%
+    # in 5 (+1.29pt). The run was LR-limited for its whole middle, and nothing
+    # about a plateau rule was going to notice.
+    #
+    # The lambdas are the ONLY thing that sets a learning rate now. The warmup
+    # ramp used to be applied by hand at the top of the epoch loop while the
+    # scheduler wrote the same field from its own state - two sources of truth
+    # for one number, and the loop's write silently won for WARMUP_EPOCHS.
+    total_epochs = start_epoch + num_epochs
+    LR_ETA_MIN_RATIO = 0.01  # floor at 1% of base, i.e. 1e-6 from 1e-4
+
+    def _cosine_factor(epoch):
+        span = max(1, total_epochs - WARMUP_EPOCHS)
+        progress = min(1.0, max(0.0, (epoch - WARMUP_EPOCHS) / span))
+        return LR_ETA_MIN_RATIO + (1.0 - LR_ETA_MIN_RATIO) * 0.5 * (1.0 + math.cos(math.pi * progress))
+
+    def _encoder_factor(epoch):
+        # Group 0's initial_lr is ENCODER_TARGET_LR, so the warmup ramp has to
+        # be expressed as a fraction of it.
+        if epoch < WARMUP_EPOCHS:
+            warmup_progress = (epoch + 1) / WARMUP_EPOCHS
+            lr = ENCODER_WARMUP_LR + (ENCODER_TARGET_LR - ENCODER_WARMUP_LR) * warmup_progress
+            return lr / ENCODER_TARGET_LR
+        return _cosine_factor(epoch)
+
+    # LambdaLR multiplies initial_lr, which it reads off the param groups. After
+    # a resume those carry whatever LR the checkpoint's optimizer state had
+    # (7.5e-5 for the 50-epoch run), so the configured bases are written back
+    # first - otherwise the cosine would restart from the decayed value and
+    # decay it a second time.
+    for group, base_lr in zip(optimizer.param_groups,
+                              (encoder_target_lr, backbone_lr, decoder_lr)):
+        group['initial_lr'] = base_lr
+
+    # last_epoch=start_epoch-1 makes __init__'s implicit first step land on
+    # start_epoch, which is the index of the first epoch this run will train.
+    scheduler = LambdaLR(optimizer,
+                         lr_lambda=[_encoder_factor, _cosine_factor, _cosine_factor],
+                         last_epoch=start_epoch - 1)
+    print(f"Using cosine LR decay over {total_epochs} epochs "
+          f"(warmup {WARMUP_EPOCHS}, floor {LR_ETA_MIN_RATIO:.0%} of base)")
 
     # Early Stopping parameters
     best_val_loss = float('inf')
@@ -251,15 +266,18 @@ def train_detection_model(model, train_loader, val_loader, num_epochs=10, start_
     epochs_no_improve = 0
 
     if resume_checkpoint is not None:
-        # Restore scheduler and early-stopping state. Without this the resumed
-        # run starts from best_val_loss=inf and overwrites the saved best model
-        # with whatever the first epoch produces.
-        if 'scheduler' in resume_checkpoint:
-            try:
-                scheduler.load_state_dict(resume_checkpoint['scheduler'])
-                print("Scheduler state loaded successfully.")
-            except Exception as e:
-                print(f"WARNING: Skipping scheduler state: {e}")
+        # The scheduler state in the checkpoint is deliberately IGNORED. Older
+        # checkpoints hold a ReduceLROnPlateau state whose keys (best,
+        # num_bad_epochs, cooldown_counter) mean nothing here, and LambdaLR's
+        # load_state_dict does self.__dict__.update(state) BEFORE it looks for
+        # 'lr_lambdas' - so a plateau state overwrites last_epoch with the
+        # plateau's own counter and only then raises, leaving the scheduler
+        # pointing at the wrong place on the cosine curve. Rebuilding from
+        # last_epoch=start_epoch-1 above is exact and needs no stored state.
+        #
+        # Restore the early-stopping state though: without it the resumed run
+        # starts from best_val_loss=inf and overwrites the saved best model with
+        # whatever the first epoch produces.
         best_val_loss = resume_checkpoint.get('best_val_loss', best_val_loss)
         best_val_acc = resume_checkpoint.get('best_val_acc', best_val_acc)
         epochs_no_improve = resume_checkpoint.get('epochs_no_improve', epochs_no_improve)
@@ -303,11 +321,10 @@ def train_detection_model(model, train_loader, val_loader, num_epochs=10, start_
             best_val_loss = float('inf')
             best_val_acc = 0.0
             epochs_no_improve = 0
-            # The plateau scheduler tracked the old scale too, so its notion of
-            # "best" is stale in exactly the same way. mode_worse is the sentinel
-            # ReduceLROnPlateau itself starts from.
-            scheduler.best = getattr(scheduler, 'mode_worse', float('inf'))
-            scheduler.num_bad_epochs = 0
+            # Nothing to reset on the scheduler side any more: the cosine
+            # schedule is a function of the epoch index alone and never looked
+            # at the loss. Under ReduceLROnPlateau its `best` tracked the old
+            # loss scale and had to be cleared here too.
 
             print("\n" + "!" * 70)
             print("Loss definition changed since this checkpoint was written.")
@@ -329,7 +346,6 @@ def train_detection_model(model, train_loader, val_loader, num_epochs=10, start_
             print(f"    best_val_loss     {stale[0]:.4f} -> inf")
             print(f"    best_val_acc      {stale[1] * 100:.2f}% -> 0.00%")
             print(f"    epochs_no_improve {stale[2]} -> 0")
-            print("    scheduler plateau state reset as well")
             print("")
             print("  The next improving epoch will therefore write a new best")
             print("  model, replacing the one saved under the old definition.")
@@ -350,19 +366,13 @@ def train_detection_model(model, train_loader, val_loader, num_epochs=10, start_
     print(f"Encoder Warmup: {WARMUP_EPOCHS} epochs ({ENCODER_WARMUP_LR} -> {ENCODER_TARGET_LR})")
     
     for epoch in range(start_epoch, start_epoch + num_epochs):
-        # Encoder Learning Rate Warmup (linear increase)
+        # No LR assignment here. The scheduler set this epoch's rates when it
+        # stepped at the end of the previous one (or at construction, for the
+        # first epoch of the run), warmup included.
         if epoch < WARMUP_EPOCHS:
-            # Linear warmup: gradually increase Encoder LR
-            warmup_progress = (epoch + 1) / WARMUP_EPOCHS
-            current_encoder_lr = ENCODER_WARMUP_LR + (ENCODER_TARGET_LR - ENCODER_WARMUP_LR) * warmup_progress
-            optimizer.param_groups[0]['lr'] = current_encoder_lr  # Encoder group
-            print(f"Epoch {epoch+1}: Encoder LR Warmup = {current_encoder_lr:.6f}")
-        elif epoch == WARMUP_EPOCHS:
-            # Warmup complete, set to target LR
-            optimizer.param_groups[0]['lr'] = ENCODER_TARGET_LR
-            if WARMUP_EPOCHS > 0:
-                print(f"Encoder Warmup Complete! LR = {ENCODER_TARGET_LR}")
-        
+            print(f"Epoch {epoch+1}: Encoder LR Warmup = "
+                  f"{optimizer.param_groups[0]['lr']:.6f}")
+
         # Training phase
         model.train()
         epoch_loss = 0.0
@@ -446,8 +456,9 @@ def train_detection_model(model, train_loader, val_loader, num_epochs=10, start_
         val_losses.append(avg_val_loss)
         val_accuracies.append(recall_iou05)
 
-        # Scheduler Step (based on val_loss)
-        scheduler.step(avg_val_loss)
+        # The scheduler steps at the very END of the loop body, not here. It no
+        # longer consumes val_loss, and stepping before the reporting below
+        # would log and checkpoint the NEXT epoch's learning rates.
 
         print(f'Epoch {epoch+1}/{start_epoch+num_epochs}:')
         print(f'  Train - Loss: {avg_train_loss:.4f}, L1: {avg_train_l1_loss:.4f}, CIoU: {avg_train_ciou_loss:.4f}, Cls: {avg_train_cls_loss:.4f}, Enc: {avg_train_enc_loss:.4f}')
@@ -531,6 +542,11 @@ def train_detection_model(model, train_loader, val_loader, num_epochs=10, start_
             print(f'Best Val Loss: {best_val_loss:.4f}, Best Recall: {best_val_acc*100:.2f}%')
             break
 
+        # Advance the cosine curve to the next epoch. Last statement in the body
+        # so everything above - logging, manifests, the checkpoint's optimizer
+        # state - records the rates this epoch actually trained with.
+        scheduler.step()
+
     print(f'\nTraining completed!')
     print(f'Best Val Loss: {best_val_loss:.4f}, Best Recall: {best_val_acc*100:.2f}%')
     # best_val_loss / best_val_acc are returned rather than recomputed by the
@@ -549,13 +565,14 @@ def main():
     # this same constant, and any other value yields a checkpoint they cannot
     # load. DetectionLoss rejects anything else outright.
     num_classes = COCO_NUM_CLASSES  # COCO classes (raw category_ids 1..90 + background at 0)
-    # Raised from 100. At 100 the extra queries were largely redundant - measured
-    # AR@10=0.364 vs AR@100=0.387, i.e. 90 further detections bought 0.023 - but
-    # that was under the old encoder objectness target, where one large object
-    # supplied 780 of 2500 positive patches and top-K could spend the whole
-    # budget inside it. With per-object centre blocks the selection has a reason
-    # to spread out, so a larger budget should now buy distinct objects.
-    num_queries = 200              # Number of object queries (100-300)
+    # Back to 100. The move to 200 was a bet that per-object centre blocks would
+    # let the extra queries find distinct objects; measured on the 50-epoch run,
+    # they did not. AR@10=0.508 vs AR@100=0.529 at 200 queries is the same 0.021
+    # marginal return as AR@10=0.364 vs AR@100=0.387 was at 100 - and COCO has
+    # about 7 instances per image, so the top 10 already cover most of them.
+    # 200 queries bought nothing, cost twice the decoder, and doubled the
+    # background mass in the query-mean classification loss.
+    num_queries = 100              # Number of object queries (100-300)
     num_encoder_layers = 2         # Transformer encoder layers (2-6) 太多層encoder很難訓練，backbone本身的特徵提取能力就很強了，所以不需太多層
     num_decoder_layers = 6         # Transformer decoder layers (4-8)
     num_aux_layers = 2             # Intermediate decoder layers feeding aux loss (0 to disable)
@@ -567,8 +584,12 @@ def main():
     # near 7-8GB, leaving room for fragmentation and the validation pass.
     batch_size = 32                # Batch size (depends on VRAM)
     num_workers = 8                # DataLoader workers; ~= physical CPU cores
-    target_total_epochs = 50       # Total training epochs (30-100)
-    early_stopping_patience = 8    # Early stopping patience (5-15) 多久沒有提升就停止
+    target_total_epochs = 100      # Total training epochs (30-100)
+    # Raised from 8. The 50-epoch run never triggered it, but it came within one
+    # epoch (a streak of 4 at epochs 42-45) purely from val-loss noise at a flat
+    # LR. This run adds a cosine ramp-down plus new canvases and augmentation,
+    # each of which buys a few epochs of re-adaptation - 8 would fire on that.
+    early_stopping_patience = 20   # Early stopping patience (5-15) 多久沒有提升就停止
     
     # === Learning Rates ===
     # LR is coupled to batch_size: 8 -> 32 means 4x fewer optimizer steps per

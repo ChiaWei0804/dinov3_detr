@@ -153,23 +153,106 @@ DEFAULT_INPUT_RESOLUTION = 800
 INPUT_RESOLUTION = int(os.environ.get('DINOV3_INPUT_RESOLUTION', DEFAULT_INPUT_RESOLUTION))
 
 
-def _build_transform(resolution):
-    """Geometry pipeline shared by training and validation."""
-    # Use BILINEAR interpolation to accelerate resize (2-3x faster than BICUBIC)
-    return torchvision.transforms.Compose([
-        torchvision.transforms.Resize(
-            (resolution, resolution),
-            interpolation=torchvision.transforms.InterpolationMode.BILINEAR),
-        torchvision.transforms.ToTensor(),
-        torchvision.transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                         std=[0.229, 0.224, 0.225])
-    ])
+PATCH_SIZE = 16
+
+# ==================== Aspect-ratio buckets ====================
+#
+# Every image used to be resized to a square, which squashes a 4:3 photo
+# vertically by 33% and a 3:2 one by 50%. Nothing downstream ever required a
+# square: dinov3_detection_model derives its patch grid from x.shape,
+# PositionEmbeddingSine normalizes each axis separately, and the encoder
+# objectness target takes (h, w) explicitly. This module was the only thing
+# hardcoding it.
+#
+# Each bucket gets its own canvas and AspectRatioBatchSampler puts only
+# same-bucket images in a batch, so there is no padding and therefore no need
+# for an attention mask - which matters, because neither TransformerEncoder nor
+# TransformerDecoder supports one.
+#
+# Targets are unaffected. They are normalized against the width and height of
+# whatever frame the image was cropped to, and a full-frame resize onto any
+# canvas preserves those fractions exactly. The box convention is unchanged.
+BUCKET_LANDSCAPE, BUCKET_SQUARE, BUCKET_PORTRAIT = 0, 1, 2
+
+BUCKET_NAMES = {
+    BUCKET_LANDSCAPE: 'landscape',
+    BUCKET_SQUARE: 'square',
+    BUCKET_PORTRAIT: 'portrait',
+}
+
+# Patch-grid shape per bucket, as a fraction of the square grid
+# (INPUT_RESOLUTION // PATCH_SIZE). At resolution 800 the square grid is 50x50,
+# so 1.14/0.86 gives 57x43 = 2451 tokens against the square's 2500: VRAM and
+# epoch time stay at the measured baseline no matter which bucket a batch is in.
+# 57/43 = 1.326 is within 1% of 4:3.
+_BUCKET_GRID_SCALES = {
+    BUCKET_LANDSCAPE: (1.14, 0.86),
+    BUCKET_SQUARE: (1.00, 1.00),
+    BUCKET_PORTRAIT: (0.86, 1.14),
+}
+
+# w/h at or above this goes to landscape, at or below its reciprocal to
+# portrait. COCO's two dominant shapes, 640x480 (1.333) and 640x427 (1.499),
+# both land in landscape, where the residual distortion is 1.01x and 1.13x
+# instead of the 1.33x and 1.50x the square canvas imposed.
+BUCKET_LANDSCAPE_MIN_AR = 1.2
+BUCKET_PORTRAIT_MAX_AR = 1.0 / BUCKET_LANDSCAPE_MIN_AR
 
 
-# Move transform and collate_fn to global scope to solve Windows multiprocessing pickle error
-global_train_transform = _build_transform(INPUT_RESOLUTION)
-# No data augmentation for validation
-global_val_transform = _build_transform(INPUT_RESOLUTION)
+def bucket_for_size(width, height):
+    """Which aspect bucket an image of this original size belongs to."""
+    if height <= 0:
+        return BUCKET_SQUARE
+    ar = width / height
+    if ar >= BUCKET_LANDSCAPE_MIN_AR:
+        return BUCKET_LANDSCAPE
+    if ar <= BUCKET_PORTRAIT_MAX_AR:
+        return BUCKET_PORTRAIT
+    return BUCKET_SQUARE
+
+
+def canvas_for_bucket(bucket, resolution=None):
+    """Canvas size (width, height) in pixels for a bucket, aligned to patches."""
+    if resolution is None:
+        resolution = INPUT_RESOLUTION
+    grid = max(1, int(resolution) // PATCH_SIZE)
+    scale_w, scale_h = _BUCKET_GRID_SCALES[bucket]
+    return (max(1, round(grid * scale_w)) * PATCH_SIZE,
+            max(1, round(grid * scale_h)) * PATCH_SIZE)
+
+
+def canvas_for_size(width, height, resolution=None):
+    """Canvas an image of this original size is resized onto."""
+    return canvas_for_bucket(bucket_for_size(width, height), resolution)
+
+
+# Built lazily per canvas and cached: a Compose is stateless, and rebuilding one
+# per batch would allocate in the DataLoader worker hot path.
+_CANVAS_TRANSFORM_CACHE = {}
+
+
+def transform_for_canvas(canvas):
+    """Geometry pipeline for one canvas, shared by training and validation."""
+    transform = _CANVAS_TRANSFORM_CACHE.get(canvas)
+    if transform is None:
+        width, height = canvas
+        # Use BILINEAR interpolation to accelerate resize (2-3x faster than BICUBIC)
+        transform = torchvision.transforms.Compose([
+            # torchvision's Resize takes (height, width), not (width, height).
+            torchvision.transforms.Resize(
+                (height, width),
+                interpolation=torchvision.transforms.InterpolationMode.BILINEAR),
+            torchvision.transforms.ToTensor(),
+            torchvision.transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                             std=[0.229, 0.224, 0.225])
+        ])
+        _CANVAS_TRANSFORM_CACHE[canvas] = transform
+    return transform
+
+
+def transform_for_size(width, height, resolution=None):
+    """Geometry pipeline for an image of this original size."""
+    return transform_for_canvas(canvas_for_size(width, height, resolution))
 
 
 def set_input_resolution(resolution):
@@ -179,12 +262,13 @@ def set_input_resolution(resolution):
     Must be called BEFORE the DataLoaders are constructed. Previously the
     resolution was hardcoded here, so the `input_resolution` knob in train.py
     had no effect whatsoever.
+
+    The value is the SQUARE-bucket side length; the other two canvases are
+    derived from it by canvas_for_bucket().
     """
-    global INPUT_RESOLUTION, global_train_transform, global_val_transform
+    global INPUT_RESOLUTION
     INPUT_RESOLUTION = int(resolution)
     os.environ['DINOV3_INPUT_RESOLUTION'] = str(INPUT_RESOLUTION)
-    global_train_transform = _build_transform(INPUT_RESOLUTION)
-    global_val_transform = _build_transform(INPUT_RESOLUTION)
     return INPUT_RESOLUTION
 
 # Photometric augmentation, training only. Applied to the PIL image before the
@@ -203,29 +287,131 @@ global_train_photometric = torchvision.transforms.ColorJitter(
 # Minimum side length (in original pixels) for a GT box to be kept.
 MIN_BOX_SIZE_PX = 1.0
 
+# Scale jitter + random crop, training only. Until now the only geometric
+# augmentation was a horizontal flip, so the model saw every object at exactly
+# one scale for its whole training run - which is a plausible share of why
+# AP(small) sits at 0.188 while AP(large) is 0.616.
+#
+# The crop keeps the CANVAS aspect ratio, so resizing it onto the canvas adds no
+# distortion at all, and a scale below 1 magnifies the content. That
+# magnification is the point: it is the only mechanism in this pipeline that
+# ever makes a small object big.
+CROP_PROBABILITY = 0.5
+CROP_MIN_SCALE = 0.5
+CROP_MAX_SCALE = 1.0
+
+
+def _extract_boxes(target_list):
+    """
+    COCO annotations -> [(x1, y1, x2, y2, category_id), ...] in original pixels.
+
+    Crowd regions (iscrowd=1) and degenerate boxes are dropped here: they are
+    not valid single-instance targets and would corrupt Hungarian matching /
+    CIoU.
+    """
+    boxes = []
+    for target in target_list or ():
+        if target.get('iscrowd', 0):
+            continue
+        bbox = target['bbox']  # [x_tl, y_tl, w, h] in original pixels
+        if bbox[2] <= MIN_BOX_SIZE_PX or bbox[3] <= MIN_BOX_SIZE_PX:
+            continue
+        boxes.append((bbox[0], bbox[1], bbox[0] + bbox[2], bbox[1] + bbox[3],
+                      target['category_id']))
+    return boxes
+
+
+def _sample_crop(orig_w, orig_h, canvas_ar):
+    """
+    A random sub-rectangle with the canvas's aspect ratio.
+
+    Starts from the largest rectangle of that aspect that fits inside the image,
+    scales it by a random factor and places it at random.
+
+    Returns (x0, y0, width, height) in original pixels.
+    """
+    if orig_w / orig_h > canvas_ar:
+        max_h = float(orig_h)
+        max_w = canvas_ar * max_h
+    else:
+        max_w = float(orig_w)
+        max_h = max_w / canvas_ar
+
+    # torch's RNG is re-seeded per DataLoader worker, python's `random` is not
+    # guaranteed to be, so every draw here comes from torch.
+    scale = CROP_MIN_SCALE + (CROP_MAX_SCALE - CROP_MIN_SCALE) * float(torch.rand(()))
+    crop_w = max(1.0, min(float(orig_w), max_w * scale))
+    crop_h = max(1.0, min(float(orig_h), max_h * scale))
+    x0 = float(torch.rand(())) * (orig_w - crop_w)
+    y0 = float(torch.rand(())) * (orig_h - crop_h)
+    return x0, y0, crop_w, crop_h
+
+
+def _boxes_in_crop(boxes, crop):
+    """
+    Keep the boxes whose CENTRE falls inside the crop, translated into crop
+    coordinates.
+
+    Centre-in-crop is the SSD/YOLO convention. Plain clipping would instead keep
+    the sliver of an object that the crop grazed and still label it with the
+    whole object's class, which is supervision the model cannot satisfy.
+    Boxes are clipped to the frame later, in normalized space.
+    """
+    x0, y0, crop_w, crop_h = crop
+    kept = []
+    for x1, y1, x2, y2, category_id in boxes:
+        cx, cy = 0.5 * (x1 + x2), 0.5 * (y1 + y2)
+        if x0 <= cx <= x0 + crop_w and y0 <= cy <= y0 + crop_h:
+            kept.append((x1 - x0, y1 - y0, x2 - x0, y2 - y0, category_id))
+    return kept
+
 
 def collate_with_multiple_targets(batch, is_train=True):
     """
     Collate a batch of (PIL image, COCO annotation list) pairs.
 
-    Training applies random horizontal flip + colour jitter; validation applies
-    neither. Annotations are converted to normalized [cx, cy, w, h].
+    Training applies scale jitter + random crop, random horizontal flip and
+    colour jitter; validation applies none of them. Annotations are converted to
+    normalized [cx, cy, w, h].
 
-    Crowd regions (iscrowd=1) and degenerate boxes are dropped: they are not
-    valid single-instance targets and would corrupt Hungarian matching / CIoU.
+    Every image in the batch is resized onto ONE canvas, chosen from the first
+    sample's aspect bucket. AspectRatioBatchSampler is what makes that correct -
+    it only ever groups same-bucket indices. A batch assembled without it still
+    works, the minority images just distort the way they did before bucketing.
     """
     images = []
     targets = []
 
-    # Select correct transform
-    transform = global_train_transform if is_train else global_val_transform
+    first_w, first_h = batch[0][0].size
+    canvas = canvas_for_size(first_w, first_h)
+    transform = transform_for_canvas(canvas)
+    canvas_ar = canvas[0] / canvas[1]
 
     # Batch process images and targets
     for img, target_list in batch:
         orig_w, orig_h = img.size
+        boxes = _extract_boxes(target_list)
 
         # torch's RNG is re-seeded per DataLoader worker, python's `random` is
-        # not guaranteed to be, so draw the flip decision from torch.
+        # not guaranteed to be, so draw every decision from torch.
+        crop = None
+        if is_train and bool(torch.rand(()) < CROP_PROBABILITY):
+            crop = _sample_crop(orig_w, orig_h, canvas_ar)
+            kept = _boxes_in_crop(boxes, crop)
+            if boxes and not kept:
+                # The crop removed every object, turning a labelled image into a
+                # background-only sample. The loss tolerates empty targets, but
+                # training on them is not what the augmentation is for.
+                crop = None
+            else:
+                boxes = kept
+
+        if crop is None:
+            frame_w, frame_h = float(orig_w), float(orig_h)
+        else:
+            x0, y0, frame_w, frame_h = crop
+            img = img.crop((x0, y0, x0 + frame_w, y0 + frame_h))
+
         do_flip = is_train and bool(torch.rand(()) < 0.5)
         if do_flip:
             img = TF.hflip(img)
@@ -233,40 +419,33 @@ def collate_with_multiple_targets(batch, is_train=True):
             img = global_train_photometric(img)
 
         # Apply transform
-        img = transform(img)
-        images.append(img)
+        images.append(transform(img))
 
         # Fast process targets
         image_targets = []
-        if target_list:
-            for target in target_list:
-                if target.get('iscrowd', 0):
-                    continue
+        for x1, y1, x2, y2, category_id in boxes:
+            # Normalize to [0, 1] against the frame the image was cropped to -
+            # the whole image when there was no crop. Any full-frame resize
+            # scales both axes uniformly, so these fractions survive it, and
+            # eval_coco.py's multiply-by-orig_size stays correct.
+            x1, y1 = x1 / frame_w, y1 / frame_h
+            x2, y2 = x2 / frame_w, y2 / frame_h
 
-                bbox = target['bbox']  # [x_tl, y_tl, w, h] in original pixels
-                if bbox[2] <= MIN_BOX_SIZE_PX or bbox[3] <= MIN_BOX_SIZE_PX:
-                    continue
+            if do_flip:
+                x1, x2 = 1.0 - x2, 1.0 - x1
 
-                # Normalize to [0, 1] against the ORIGINAL size; the non
-                # aspect-preserving resize below is undone by the same ratio at
-                # inference time, so this stays consistent.
-                x1, y1 = bbox[0] / orig_w, bbox[1] / orig_h
-                x2, y2 = x1 + bbox[2] / orig_w, y1 + bbox[3] / orig_h
+            # Clip to the frame; a few COCO boxes stick out slightly, and a
+            # cropped one can stick out a lot.
+            x1, y1 = max(0.0, x1), max(0.0, y1)
+            x2, y2 = min(1.0, x2), min(1.0, y2)
+            w, h = x2 - x1, y2 - y1
+            if w <= 0.0 or h <= 0.0:
+                continue
 
-                if do_flip:
-                    x1, x2 = 1.0 - x2, 1.0 - x1
-
-                # Clip to the image; a few COCO boxes stick out slightly.
-                x1, y1 = max(0.0, x1), max(0.0, y1)
-                x2, y2 = min(1.0, x2), min(1.0, y2)
-                w, h = x2 - x1, y2 - y1
-                if w <= 0.0 or h <= 0.0:
-                    continue
-
-                image_targets.append({
-                    'bbox': torch.tensor([x1 + w * 0.5, y1 + h * 0.5, w, h], dtype=torch.float32),
-                    'category_id': torch.tensor(target['category_id'], dtype=torch.long)
-                })
+            image_targets.append({
+                'bbox': torch.tensor([x1 + w * 0.5, y1 + h * 0.5, w, h], dtype=torch.float32),
+                'category_id': torch.tensor(category_id, dtype=torch.long)
+            })
 
         targets.append(image_targets)
 
@@ -282,13 +461,72 @@ def collate_val(batch):
     return collate_with_multiple_targets(batch, is_train=False)
 
 
+class AspectRatioBatchSampler(torch.utils.data.Sampler):
+    """
+    Yield batches whose images all share one aspect bucket.
+
+    That homogeneity is what lets collate_with_multiple_targets pick a single
+    canvas per batch without padding: a batch never mixes a 912x688 image with a
+    688x912 one, so torch.stack always agrees and no attention mask is needed.
+
+    Batch COUNT is fixed across epochs (each bucket is chunked independently and
+    the tail batch is kept), so len() is exact and the progress bar does not
+    drift between epochs.
+    """
+
+    def __init__(self, bucket_ids, batch_size, shuffle):
+        self.batch_size = int(batch_size)
+        self.shuffle = bool(shuffle)
+        self._by_bucket = {}
+        for index, bucket in enumerate(bucket_ids):
+            self._by_bucket.setdefault(bucket, []).append(index)
+        self._num_batches = sum(
+            (len(indices) + self.batch_size - 1) // self.batch_size
+            for indices in self._by_bucket.values())
+
+    def bucket_counts(self):
+        return {bucket: len(indices) for bucket, indices in self._by_bucket.items()}
+
+    def __iter__(self):
+        batches = []
+        for indices in self._by_bucket.values():
+            if self.shuffle:
+                order = torch.randperm(len(indices)).tolist()
+                indices = [indices[i] for i in order]
+            for start in range(0, len(indices), self.batch_size):
+                batches.append(indices[start:start + self.batch_size])
+        if self.shuffle:
+            # Without this the run would see every landscape batch, then every
+            # square one - a bucket-ordered curriculum nobody asked for.
+            batches = [batches[i] for i in torch.randperm(len(batches)).tolist()]
+        return iter(batches)
+
+    def __len__(self):
+        return self._num_batches
+
+
+def bucket_ids_for_dataset(dataset):
+    """
+    Aspect bucket per dataset index, read from the COCO index rather than by
+    decoding images - the sampler needs all 118k of them before epoch 1 starts.
+    """
+    coco = dataset.coco
+    bucket_ids = []
+    for image_id in dataset.ids:
+        info = coco.loadImgs(image_id)[0]
+        bucket_ids.append(bucket_for_size(info['width'], info['height']))
+    return bucket_ids
+
+
 def load_coco_dataset(batch_size=48, input_resolution=None, num_workers=8):
     """
     Load COCO2017 datasets with specified batch size.
 
     Args:
         batch_size: Batch size for training and validation (default: 48)
-        input_resolution: Square input resolution; None keeps the current setting
+        input_resolution: Side of the SQUARE bucket's canvas; the landscape and
+            portrait canvases are derived from it. None keeps the current
+            setting.
         num_workers: DataLoader worker processes. Decoding a JPEG and resizing it
             to 800x800 is CPU-bound, so this wants to be close to the physical
             core count or the GPU will sit waiting on data.
@@ -312,17 +550,31 @@ def load_coco_dataset(batch_size=48, input_resolution=None, num_workers=8):
         transform=None
     )
     
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
+    train_sampler = AspectRatioBatchSampler(bucket_ids_for_dataset(train_dataset),
+                                            batch_size=batch_size, shuffle=True)
+    val_sampler = AspectRatioBatchSampler(bucket_ids_for_dataset(val_dataset),
+                                          batch_size=batch_size, shuffle=False)
+
+    # batch_sampler is mutually exclusive with batch_size / shuffle / drop_last.
+    train_loader = DataLoader(train_dataset, batch_sampler=train_sampler,
                               num_workers=num_workers, pin_memory=True, collate_fn=collate_train,
                               persistent_workers=num_workers > 0, prefetch_factor=4 if num_workers > 0 else None)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False,
+    val_loader = DataLoader(val_dataset, batch_sampler=val_sampler,
                             num_workers=num_workers, pin_memory=True, collate_fn=collate_val,
                             persistent_workers=num_workers > 0, prefetch_factor=4 if num_workers > 0 else None)
 
     print(f"COCO2017 datasets loaded:")
     print(f"  Train dataset: {len(train_dataset)} samples")
     print(f"  Val dataset: {len(val_dataset)} samples")
-    print(f"  Input resolution: {INPUT_RESOLUTION}×{INPUT_RESOLUTION}")
+    print(f"  Aspect buckets (canvas / train imgs / val imgs):")
+    train_counts = train_sampler.bucket_counts()
+    val_counts = val_sampler.bucket_counts()
+    for bucket in (BUCKET_LANDSCAPE, BUCKET_SQUARE, BUCKET_PORTRAIT):
+        canvas_w, canvas_h = canvas_for_bucket(bucket)
+        print(f"    {BUCKET_NAMES[bucket]:<9} {canvas_w}×{canvas_h} "
+              f"({canvas_w // PATCH_SIZE}×{canvas_h // PATCH_SIZE} patches, "
+              f"{(canvas_w // PATCH_SIZE) * (canvas_h // PATCH_SIZE)} tokens)  "
+              f"{train_counts.get(bucket, 0)} / {val_counts.get(bucket, 0)}")
     print(f"  Batch size: {batch_size}, workers: {num_workers}")
     print(f"  Train batches: {len(train_loader)}")
     print(f"  Val batches: {len(val_loader)}")
