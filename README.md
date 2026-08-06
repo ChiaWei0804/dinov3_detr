@@ -5,8 +5,8 @@ end-to-end on COCO 2017.
 
 The backbone never updates. Everything that learns — two projection layers, a Transformer
 encoder, a query-selection head, a six-layer Transformer decoder and two prediction heads —
-is about 30M parameters sitting on top of frozen features. The point of the project is to
-find out how much detection performance you can get out of self-supervised ViT features
+is **8.5M parameters** sitting on top of an 86M frozen backbone. The point of the project is
+to find out how much detection performance you can get out of self-supervised ViT features
 without ever touching them.
 
 ---
@@ -136,7 +136,7 @@ Architecture rows come from the upstream source (`dinov3/hub/detectors.py`,
 |---|---|---|
 | **Backbone** | **ViT-7B/16** — 6,716M params, width 4096, 40 layers, 32 heads, SwiGLU FFN | **ViT-B/16** — 86M params, width 768, 12 layers, 12 heads |
 | Backbone frozen | yes | yes |
-| Trainable detector | ~100M params | ~30M params |
+| Trainable detector | ~100M params | 8.5M params |
 | **COCO mAP (val2017)** | **66.1** | **42.5** (at epoch 80 of 100) |
 | Detection training | Objects365 @1536px (22 ep) → Objects365 @2048px (4 ep) → COCO @2048px (12 ep) | COCO @800px only |
 | Detector width | 768 | 256 |
@@ -155,10 +155,13 @@ Architecture rows come from the upstream source (`dinov3/hub/detectors.py`,
 
 Two things are worth pulling out of that table.
 
-**The official detector head is larger than this project's entire backbone.** ~100M trainable
-parameters against ViT-B/16's 86M. The frozen ViT it sits on is 6.7B — 78× bigger than the
-one used here — so 66.1 against 42.5 mAP is a gap between different weight classes, not
-evidence about the recipe.
+**The official detector head alone is larger than this project's entire backbone.** ~100M
+trainable parameters against ViT-B/16's 86M — and about 12× this project's 8.5M head. The
+frozen ViT it sits on is 6.7B, 78× bigger than the one used here, so 66.1 against 42.5 mAP is
+a gap between different weight classes, not evidence about the recipe.
+
+For reference, where those 8.5M sit: decoder 6.32M, encoder 1.58M, the two projections 0.39M,
+the two heads 0.19M, query-selection head 257.
 
 **The training budget is not comparable either.** The official numbers come after 26 epochs
 of Objects365 at 1536–2048px before COCO is touched at all; this project trains on COCO alone
@@ -204,7 +207,7 @@ flowchart TD
 
     CLSH --> OUT1["pred_logits<br/>B x K x 92"]
     BBH --> OUT2["pred_boxes cxcywh<br/>B x K x 4"]
-    DEC -.intermediate layers.-> AUX["aux_outputs<br/>last 2 decoder layers"]
+    DEC -.intermediate layers.-> AUX["aux_outputs<br/>last 2 intermediate layers"]
     OBJ -.-> OUT3["enc_objectness<br/>B x N"]
 ```
 
@@ -579,6 +582,10 @@ Written to `runs/` (gitignored):
 | `training_curves_resumed.png` | end of run |
 | `train.log` | continuously |
 
+Note the asymmetry: the **best** checkpoint is written only when validation *loss* improves,
+but the early-stopping counter resets when *either* loss or recall improves. A run can
+therefore keep training for a long time without producing a new best model.
+
 Every `.pth` gets a **sibling `.json` manifest** with zero dependencies and always on: full
 hyperparameters, architecture, metrics, learning rates, git commit (with a `-dirty` suffix),
 Python/torch/CUDA/GPU, and the `loss_semantics_version`. Without it a checkpoint becomes
@@ -621,7 +628,8 @@ only a lower resolution or a smaller backbone would move the number.
 
 ## Repository layout
 
-Everything tracked here is this project's own code — 17 Python files:
+Everything tracked here is this project's own code. The detector itself is 17 Python files at
+the repository root:
 
 ```
 train.py                     training loop, config, resume logic
@@ -652,9 +660,9 @@ docs/val_loss_curve.svg
 docs/recall_curve.svg
 ```
 
-After [Setup](#setup) your working directory additionally contains three untracked paths —
-`dinov3/` and `hubconf.py` from upstream, and `weights/` — plus `runs/` once you start
-training. All four are gitignored.
+Four more paths appear in your working directory but are gitignored and never committed:
+`dinov3/` and `hubconf.py` (from upstream, see [Setup](#setup)), `weights/` (the backbone
+checkpoint), and `runs/` (created on your first training run).
 
 ---
 
