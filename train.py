@@ -28,7 +28,7 @@ Comparison with the official DINOv3 detector (dinov3_vit7b16_de):
 - The backbone is NOT the same model. The official detector runs on ViT-7B/16
   (6,716M params, width 4096, 40 layers); this uses ViT-B/16 (86M params,
   width 768, 12 layers), 78x smaller. The official detector HEAD alone (~100M
-  trainable) is larger than this project's entire backbone. 66.1 vs 42.5 mAP
+  trainable) is larger than this project's entire backbone. 66.1 vs 43.1 mAP
   on COCO val2017 is a gap between weight classes, not between recipes.
 - Same: frozen backbone, independent Transformer Encoder, mixed query
   selection, one-to-one matching with auxiliary supervision, 91 classes,

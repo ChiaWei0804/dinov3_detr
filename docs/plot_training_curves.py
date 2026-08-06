@@ -5,7 +5,7 @@ Render the training curves in training_history.csv to SVG.
 
 Two charts, deliberately drawn differently:
 
-  Recall is ONE line across all 80 epochs. Recall@IoU0.5 is a weight-independent
+  Recall is ONE line across the whole run. Recall@IoU0.5 is a weight-independent
   count of matched ground-truth boxes, so it means the same thing before and
   after the config change and the two halves are directly comparable.
 
@@ -54,7 +54,7 @@ def style(ax, xlabel, ylabel, title):
     ax.set_axisbelow(True)
 
 
-def boundary(ax, x=50.5):
+def boundary(ax, x):
     ax.axvline(x, color=CHROME, alpha=0.5, linestyle="--", linewidth=1)
 
 
@@ -73,17 +73,23 @@ def main():
     ep = lambda rs: [int(r["epoch"]) for r in rs]
     col = lambda rs, k: [float(r[k]) for r in rs]
 
+    # Derived from the data, not hardcoded - otherwise extending the run leaves
+    # the legend quietly claiming the old epoch range.
+    label_a = f"Config A (epochs {min(ep(a))}-{max(ep(a))})"
+    label_b = f"Config B (epochs {min(ep(b))}-{max(ep(b))})"
+    boundary_x = max(ep(a)) + 0.5
+
     # ---- Validation loss -------------------------------------------------
     fig, ax = plt.subplots(figsize=(9, 4.2))
     ax.plot(ep(a), col(a, "val_loss"), color=COLOR_A, linewidth=1.8,
-            label="Config A (epochs 1-50)")
+            label=label_a)
     ax.plot(ep(b), col(b, "val_loss"), color=COLOR_B, linewidth=1.8,
-            label="Config B (epochs 51-80)")
-    boundary(ax)
+            label=label_b)
+    boundary(ax, boundary_x)
     style(ax, "Epoch", "Validation loss",
           "Validation loss per epoch  -  segments are NOT comparable")
     ax.annotate("loss redefined here\n(LOSS_SEMANTICS_VERSION 4 to 5)",
-                xy=(50.5, max(col(b, "val_loss"))), xytext=(28, 5.6),
+                xy=(boundary_x, max(col(b, "val_loss"))), xytext=(28, 5.6),
                 color=CHROME, fontsize=8.5,
                 arrowprops=dict(arrowstyle="->", color=CHROME, alpha=0.6))
     leg = ax.legend(frameon=False, fontsize=9)
@@ -96,10 +102,10 @@ def main():
     # Joined across the boundary on purpose: this metric IS comparable, and the
     # dip at 51 is a real re-adaptation cost, not an artefact of rescaling.
     ax.plot(ep(a), col(a, "recall_iou05"), color=COLOR_A, linewidth=1.8,
-            label="Config A (epochs 1-50)")
+            label=label_a)
     ax.plot(ep(a)[-1:] + ep(b), col(a, "recall_iou05")[-1:] + col(b, "recall_iou05"),
-            color=COLOR_B, linewidth=1.8, label="Config B (epochs 51-80)")
-    boundary(ax)
+            color=COLOR_B, linewidth=1.8, label=label_b)
+    boundary(ax, boundary_x)
     style(ax, "Epoch", "Recall@IoU0.5 (%)",
           "Validation Recall@IoU0.5 per epoch")
     ax.annotate("config change:\naspect buckets, crop aug,\n200 to 100 queries",

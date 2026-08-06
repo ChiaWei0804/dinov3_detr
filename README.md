@@ -45,8 +45,8 @@ augmentation, auxiliary loss off, CIoU weight 2.0. Trained 50 epochs from scratc
 **Config B** — what this repository is set up for today:
 [aspect-ratio buckets](#data-pipeline), 100 queries, cosine LR decay,
 [scale jitter + random crop](#data-pipeline), auxiliary loss at 0.4, CIoU weight 5.0. Resumed
-from config A's epoch-50 checkpoint and trained to **epoch 80 of a planned 100** — so these
-are a snapshot of a run in progress, not final numbers.
+from config A's epoch-50 checkpoint and run to completion at **epoch 100**. Early stopping
+(patience 20) never fired; the longest run without improvement was 3 epochs.
 
 For scale: Meta's own DINOv3 detector reaches 66.1 mAP on the same split, but it runs a 6.7B
 backbone against this project's 86M and pretrains on Objects365 at 2048px first. See
@@ -68,8 +68,10 @@ represents a redefinition rather than a regression.
 Recall **is** comparable across the boundary — it counts matched ground-truth boxes and does
 not depend on loss weights — so it is drawn as one line. The dip at epoch 51 is a real
 re-adaptation cost: new canvases and crop augmentation make the task genuinely harder, and it
-takes about 25 epochs to work back. At epoch 80 recall is 77.33% against config A's peak of
-77.83%, while average max IoU (0.6716) has already passed config A's best (0.6690).
+takes about 25 epochs to work back. Config B passes config A's peak recall only at the very
+end (77.88% at epoch 95 against 77.83% at epoch 50), but average max IoU clears it much
+earlier and by more (0.6774 against 0.6690) — the boxes were fitting better long before the
+recall count caught up.
 
 Per-epoch numbers are in [docs/training_history.csv](docs/training_history.csv); regenerate
 the charts with `python docs/plot_training_curves.py`.
@@ -78,20 +80,23 @@ the charts with `python docs/plot_training_curves.py`.
 
 `pycocotools` evaluation on the full 5k `val2017` split:
 
-| Metric | Config A @ ep50 | Config B @ ep80 | Δ |
-|---|---|---|---|
-| **AP @ IoU 0.50:0.95** | 0.398 | **0.425** | +0.027 |
-| AP @ IoU 0.50 | 0.637 | 0.653 | +0.016 |
-| AP @ IoU 0.75 | 0.414 | 0.446 | +0.032 |
-| AP small | 0.188 | 0.190 | +0.002 |
-| AP medium | 0.431 | 0.462 | +0.031 |
-| AP large | 0.616 | 0.656 | +0.040 |
-| AR @ 1 det | 0.332 | 0.347 | +0.015 |
-| AR @ 10 dets | 0.508 | 0.540 | +0.032 |
-| AR @ 100 dets | 0.529 | 0.563 | +0.034 |
-| AR small | 0.278 | 0.290 | +0.012 |
-| AR medium | 0.582 | 0.623 | +0.041 |
-| AR large | 0.773 | 0.833 | +0.060 |
+| Metric | Config A @ ep50 | Config B @ ep80 | **Config B @ ep100** | Δ vs A |
+|---|---|---|---|---|
+| **AP @ IoU 0.50:0.95** | 0.398 | 0.425 | **0.431** | +0.033 |
+| AP @ IoU 0.50 | 0.637 | 0.653 | 0.659 | +0.022 |
+| AP @ IoU 0.75 | 0.414 | 0.446 | 0.455 | +0.041 |
+| AP small | 0.188 | 0.190 | 0.202 | +0.014 |
+| AP medium | 0.431 | 0.462 | 0.471 | +0.040 |
+| AP large | 0.616 | 0.656 | 0.661 | +0.045 |
+| AR @ 1 det | 0.332 | 0.347 | 0.351 | +0.019 |
+| AR @ 10 dets | 0.508 | 0.540 | 0.546 | +0.038 |
+| AR @ 100 dets | 0.529 | 0.563 | 0.571 | +0.042 |
+| AR small | 0.278 | 0.290 | 0.302 | +0.024 |
+| AR medium | 0.582 | 0.623 | 0.631 | +0.049 |
+| AR large | 0.773 | 0.833 | 0.834 | +0.061 |
+
+The epoch-80 column is kept because the last 20 epochs did something the first 30 did not —
+see the small-object note below.
 
 Three things worth reading carefully before taking these at face value.
 
@@ -100,21 +105,35 @@ scoring below 0.05; config B keeps the top 100 by score regardless. Low-scoring 
 used to be thrown away now count, which mechanically lifts recall at high detection budgets.
 The numbers that are *not* affected by this are AR@1 (the single highest-scoring box was
 always far above 0.05) and the AP75/AP50 ratio (a ratio cancels the change in detection
-volume). Both improved, so the model did genuinely get better — just don't quote the +0.034
+volume). Both improved, so the model did genuinely get better — just don't quote the +0.042
 as the size of it.
 
-**The gain is concentrated at strict IoU.** AP75 rose 0.032 while AP50 rose only 0.016, taking
-the AP75/AP50 ratio from 0.650 to 0.683. That is the signature of aspect-ratio bucketing: no
+**The gain is concentrated at strict IoU.** AP75 rose 0.041 while AP50 rose only 0.022, taking
+the AP75/AP50 ratio from 0.650 to 0.690. That is the signature of aspect-ratio bucketing: no
 longer squashing a 4:3 photo to 1:1 does not help you *find* many more objects, but it makes
 the boxes you do find fit better.
 
-**Small objects barely moved**, +0.002 AP, despite scale jitter and random crop having been
-added specifically for them. AR(small) rose more (+0.012), so augmentation does make small
-objects get *found* more often — the model just cannot localise or score them well enough for
-it to become AP. The likely ceiling is patch resolution: with ViT-B/16 at 800px, a COCO
-"small" object (< 32² original pixels) often does not fill even one 16×16 patch, so the
-features simply are not there. The APs/APl ratio actually widened, 0.305 → 0.290. Multi-scale
-features are the fix, and they are not in this repository yet.
+**Small objects only moved at the very end, and that is the most interesting thing here.**
+Through epoch 80 the scale jitter and random crop added specifically for small objects looked
+like a failure — AP(small) had gained +0.002, and the APs/APl ratio had actually *widened*
+from 0.305 to 0.290. Then the final 20 epochs delivered +0.012 on their own, six times the
+gain of the preceding thirty, bringing APs/APl back to 0.306:
+
+| | Config A @ ep50 | ep80 | ep100 |
+|---|---|---|---|
+| AP small | 0.188 | 0.190 | 0.202 |
+| APs / APl ratio | 0.305 | 0.290 | 0.306 |
+
+The augmentation did work, but only once the cosine schedule had taken the LR down to roughly
+1e-6. The plausible reading is that magnified small objects are the hardest, noisiest part of
+the training signal, and the model could not consolidate them while the LR was still large
+enough to keep chasing the easier medium and large boxes. **Anyone stopping this run at epoch
+80 would have concluded the augmentation did nothing.**
+
+A ceiling is still there — patch resolution. With ViT-B/16 at 800px a COCO "small" object
+(< 32² original pixels) often does not fill even one 16×16 patch, so beyond some point the
+features simply are not present. Multi-scale features are the fix, and they are not in this
+repository yet.
 
 ---
 
@@ -137,7 +156,7 @@ Architecture rows come from the upstream source (`dinov3/hub/detectors.py`,
 | **Backbone** | **ViT-7B/16** — 6,716M params, width 4096, 40 layers, 32 heads, SwiGLU FFN | **ViT-B/16** — 86M params, width 768, 12 layers, 12 heads |
 | Backbone frozen | yes | yes |
 | Trainable detector | ~100M params | 8.5M params |
-| **COCO mAP (val2017)** | **66.1** | **42.5** (at epoch 80 of 100) |
+| **COCO mAP (val2017)** | **66.1** | **43.1** |
 | Detection training | Objects365 @1536px (22 ep) → Objects365 @2048px (4 ep) → COCO @2048px (12 ep) | COCO @800px only |
 | Detector width | 768 | 256 |
 | Encoder / decoder layers | 6 / 6 | 2 / 6 |
@@ -157,7 +176,7 @@ Two things are worth pulling out of that table.
 
 **The official detector head alone is larger than this project's entire backbone.** ~100M
 trainable parameters against ViT-B/16's 86M — and about 12× this project's 8.5M head. The
-frozen ViT it sits on is 6.7B, 78× bigger than the one used here, so 66.1 against 42.5 mAP is
+frozen ViT it sits on is 6.7B, 78× bigger than the one used here, so 66.1 against 43.1 mAP is
 a gap between different weight classes, not evidence about the recipe.
 
 For reference, where those 8.5M sit: decoder 6.32M, encoder 1.58M, the two projections 0.39M,
@@ -654,7 +673,7 @@ generate_png.py              architecture diagram
 Plus the recorded run history behind [Results](#results):
 
 ```
-docs/training_history.csv    per-epoch val loss / recall / avg max IoU / LR, epochs 1-80
+docs/training_history.csv    per-epoch val loss / recall / avg max IoU / LR, epochs 1-100
 docs/plot_training_curves.py regenerates the two SVGs from that CSV
 docs/val_loss_curve.svg
 docs/recall_curve.svg
