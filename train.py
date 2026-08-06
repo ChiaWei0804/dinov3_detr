@@ -24,11 +24,18 @@ Configuration:
 - Batch size: 8 (with AMP for memory efficiency)
 - Training: COCO 2017, see target_total_epochs in main()
 
-Comparison with official DINOv3 implementation:
-- Same: frozen backbone, independent Transformer Encoder, end-to-end training
-- Different:
-  * Official: Objects365 pretraining + 2048px resolution + 100M params detector
-  * Ours: direct COCO training + 800px resolution + ~30M params detector
+Comparison with the official DINOv3 detector (dinov3_vit7b16_de):
+- The backbone is NOT the same model. The official detector runs on ViT-7B/16
+  (width 4096, 40 layers, ~7B params); this uses ViT-B/16 (width 768, 12
+  layers, ~86M params), roughly 80x smaller. Everything below is a difference
+  of recipe at a completely different scale, not a peer comparison.
+- Same: frozen backbone, independent Transformer Encoder, mixed query
+  selection, one-to-one matching with auxiliary supervision, 91 classes,
+  6 decoder layers, single feature level
+- Different: 1500+1500 queries vs 100, encoder 6 layers vs 2, detector width
+  768 vs 256, plus two-stage box refinement, look-forward-twice, hybrid
+  one-to-many matching (k=6) and Plain-DETR global RPE decoder attention -
+  none of which are implemented here.
 
 All checkpoints, best model and final model are saved in runs/ directory.
 """

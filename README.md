@@ -14,6 +14,7 @@ without ever touching them.
 ## Table of contents
 
 - [Architecture](#architecture)
+  - [Relation to the official DINOv3 detector](#relation-to-the-official-dinov3-detector)
   - [Data flow](#data-flow)
   - [How the backbone is loaded](#how-the-backbone-is-loaded)
   - [Stage by stage](#stage-by-stage)
@@ -36,14 +37,44 @@ without ever touching them.
 
 ## Architecture
 
-Compared with the detector in the official DINOv3 release, this one is deliberately small:
+### Relation to the official DINOv3 detector
 
-| | Official DINOv3 detector | This project |
+DINOv3 ships exactly one detector, `dinov3_vit7b16_de`, and the single most important thing
+to say about it is that **it runs on a different backbone entirely**. The official model uses
+ViT-**7B**/16; this project uses ViT-**B**/16, which is roughly 80× smaller. Any comparison
+below is a comparison of recipes at wildly different scale, not of two peers.
+
+Both columns are read straight out of the upstream source (`dinov3/hub/detectors.py` and
+`dinov3/hub/backbones.py`), not from the paper:
+
+| | Official `dinov3_vit7b16_de` | This project |
 |---|---|---|
-| Pretraining | Objects365 → COCO | COCO only |
-| Resolution | 2048px | 800px |
-| Detector size | ~100M params | ~30M params |
-| Backbone | frozen | frozen |
+| **Backbone** | **ViT-7B/16** — width 4096, 40 layers, 32 heads, SwiGLU FFN (~7B params) | **ViT-B/16** — width 768, 12 layers, 12 heads (~86M params) |
+| Backbone frozen | yes | yes |
+| Detector width | 768 | 256 |
+| Encoder layers | 6 | 2 |
+| Decoder layers | 6 | 6 |
+| FFN dim | 2048 | 1024 |
+| Queries | 1500 one-to-one + 1500 one-to-many | 100 |
+| Mixed query selection | yes | yes |
+| Two-stage, box refine, look-forward-twice | yes | no |
+| Hybrid one-to-many matching | yes (k = 6) | no |
+| Decoder attention | `global_rpe_decomp` (Plain-DETR global RPE) | plain cross-attention |
+| Box reparameterization | yes | centre anchored to the source patch only |
+| Feature levels | 1 | 1 |
+| Classes / aux loss | 91 / yes | 91 / yes |
+
+So the parts this project actually reproduces are the *structural* ideas — frozen backbone, a
+separate Transformer encoder, mixed query selection, one-to-one matching with auxiliary
+supervision at 91 classes. What it leaves out is everything that makes the official model
+expensive: the 7B backbone, 1500 one-to-one queries against 100, iterative box refinement,
+the extra 1500-query one-to-many branch, and Plain-DETR's global relative position encoding
+in the decoder.
+
+On top of that the official weights are produced with a heavier detection recipe than plain
+COCO training (the DINOv3 paper describes detection pretraining at higher resolution) — that
+part is not verifiable from the source in this repository, so treat it as background rather
+than as a figure quoted here.
 
 ### Data flow
 
