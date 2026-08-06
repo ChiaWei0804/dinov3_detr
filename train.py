@@ -26,16 +26,22 @@ Configuration:
 
 Comparison with the official DINOv3 detector (dinov3_vit7b16_de):
 - The backbone is NOT the same model. The official detector runs on ViT-7B/16
-  (width 4096, 40 layers, ~7B params); this uses ViT-B/16 (width 768, 12
-  layers, ~86M params), roughly 80x smaller. Everything below is a difference
-  of recipe at a completely different scale, not a peer comparison.
+  (6,716M params, width 4096, 40 layers); this uses ViT-B/16 (86M params,
+  width 768, 12 layers), 78x smaller. The official detector HEAD alone (~100M
+  trainable) is larger than this project's entire backbone. 66.1 vs 42.5 mAP
+  on COCO val2017 is a gap between weight classes, not between recipes.
 - Same: frozen backbone, independent Transformer Encoder, mixed query
   selection, one-to-one matching with auxiliary supervision, 91 classes,
   6 decoder layers, single feature level
 - Different: 1500+1500 queries vs 100, encoder 6 layers vs 2, detector width
   768 vs 256, plus two-stage box refinement, look-forward-twice, hybrid
   one-to-many matching (k=6) and Plain-DETR global RPE decoder attention -
-  none of which are implemented here.
+  none of which are implemented here. Loss differs too: officially Focal +
+  L1 + GIoU, here CrossEntropy + L1 + CIoU.
+- Training budget is not comparable: the official numbers follow 22 epochs of
+  Objects365 at 1536px plus 4 at 2048px BEFORE 12 epochs of COCO at 2048px.
+  This trains on COCO alone at 800px.
+Sources: arxiv.org/abs/2508.10104 and the model table in the upstream repo.
 
 All checkpoints, best model and final model are saved in runs/ directory.
 """

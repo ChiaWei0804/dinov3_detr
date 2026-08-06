@@ -41,21 +41,27 @@ without ever touching them.
 
 DINOv3 ships exactly one detector, `dinov3_vit7b16_de`, and the single most important thing
 to say about it is that **it runs on a different backbone entirely**. The official model uses
-ViT-**7B**/16; this project uses ViT-**B**/16, which is roughly 80× smaller. Any comparison
-below is a comparison of recipes at wildly different scale, not of two peers.
+ViT-**7B**/16 (6,716M params); this project uses ViT-**B**/16 (86M), which is 78× smaller.
+Any comparison below is between wildly different weight classes, not between two peers.
 
-Both columns are read straight out of the upstream source (`dinov3/hub/detectors.py` and
-`dinov3/hub/backbones.py`), not from the paper:
+Architecture rows come from the upstream source (`dinov3/hub/detectors.py`,
+`dinov3/hub/backbones.py`); parameter counts, results and the training recipe come from the
+[DINOv3 paper](https://arxiv.org/abs/2508.10104) and the
+[official model table](https://github.com/facebookresearch/dinov3).
 
 | | Official `dinov3_vit7b16_de` | This project |
 |---|---|---|
-| **Backbone** | **ViT-7B/16** — width 4096, 40 layers, 32 heads, SwiGLU FFN (~7B params) | **ViT-B/16** — width 768, 12 layers, 12 heads (~86M params) |
+| **Backbone** | **ViT-7B/16** — 6,716M params, width 4096, 40 layers, 32 heads, SwiGLU FFN | **ViT-B/16** — 86M params, width 768, 12 layers, 12 heads |
 | Backbone frozen | yes | yes |
+| Trainable detector | ~100M params | ~30M params |
+| **COCO mAP (val2017)** | **66.1** | **42.5** (at epoch 80 of 100) |
+| Detection training | Objects365 @1536px (22 ep) → Objects365 @2048px (4 ep) → COCO @2048px (12 ep) | COCO @800px only |
 | Detector width | 768 | 256 |
-| Encoder layers | 6 | 2 |
-| Decoder layers | 6 | 6 |
+| Encoder / decoder layers | 6 / 6 | 2 / 6 |
 | FFN dim | 2048 | 1024 |
 | Queries | 1500 one-to-one + 1500 one-to-many | 100 |
+| Classification loss | Focal (weight 2) | CrossEntropy (weight 2, `eos_coef` 0.1) |
+| Box loss | L1 (1) + GIoU (2) | L1 (8) + CIoU (5) |
 | Mixed query selection | yes | yes |
 | Two-stage, box refine, look-forward-twice | yes | no |
 | Hybrid one-to-many matching | yes (k = 6) | no |
@@ -64,17 +70,24 @@ Both columns are read straight out of the upstream source (`dinov3/hub/detectors
 | Feature levels | 1 | 1 |
 | Classes / aux loss | 91 / yes | 91 / yes |
 
-So the parts this project actually reproduces are the *structural* ideas — frozen backbone, a
-separate Transformer encoder, mixed query selection, one-to-one matching with auxiliary
-supervision at 91 classes. What it leaves out is everything that makes the official model
-expensive: the 7B backbone, 1500 one-to-one queries against 100, iterative box refinement,
-the extra 1500-query one-to-many branch, and Plain-DETR's global relative position encoding
-in the decoder.
+Two things are worth pulling out of that table.
 
-On top of that the official weights are produced with a heavier detection recipe than plain
-COCO training (the DINOv3 paper describes detection pretraining at higher resolution) — that
-part is not verifiable from the source in this repository, so treat it as background rather
-than as a figure quoted here.
+**The official detector head is larger than this project's entire backbone.** ~100M trainable
+parameters against ViT-B/16's 86M. The frozen ViT it sits on is 6.7B — 78× bigger than the
+one used here — so 66.1 against 42.5 mAP is a gap between different weight classes, not
+evidence about the recipe.
+
+**The training budget is not comparable either.** The official numbers come after 26 epochs
+of Objects365 at 1536–2048px before COCO is touched at all; this project trains on COCO alone
+at 800px. Detection pretraining and resolution both matter a great deal for AP, and neither
+is present here.
+
+What this project does reproduce are the structural ideas: a frozen backbone, a separate
+Transformer encoder, mixed query selection, one-to-one Hungarian matching with auxiliary
+supervision, 91 classes. What it leaves out is everything expensive — the 6.7B backbone, 1500
+one-to-one queries against 100, the extra 1500-query one-to-many branch, iterative box
+refinement, and Plain-DETR's global relative position encoding in the decoder. The loss is
+also not the same recipe: Focal + GIoU officially, CrossEntropy + CIoU here.
 
 ### Data flow
 
