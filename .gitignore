@@ -1,3 +1,9 @@
+# DINOv3 上游原始碼（Meta 版權，受 DINOv3 License Agreement 約束）
+# 這個專案只放自己寫的偵測器，不轉散布 Meta 的程式碼。
+# 兩者都是執行時必需，請依 README 的 Setup 從上游取得後放到專案根目錄。
+dinov3/
+hubconf.py
+
 # 模型權重與 checkpoint（weights/ 有 327MB，不進版控）
 weights/
 *.pth
