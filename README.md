@@ -20,6 +20,9 @@ without ever touching them.
   - [Design decisions](#design-decisions)
 - [Loss](#loss)
 - [Data pipeline](#data-pipeline)
+- [Results](#results)
+  - [Training curves](#training-curves)
+  - [COCO mAP](#coco-map)
 - [Setup](#setup)
 - [Training](#training)
 - [Resuming a run](#resuming-a-run)
@@ -261,6 +264,83 @@ depend on which bucket a batch lands in. COCO's two dominant shapes, 640×480 (1
 
 Crowd regions (`iscrowd=1`) and degenerate boxes are dropped — they are not valid
 single-instance targets and would corrupt Hungarian matching.
+
+---
+
+## Results
+
+Two configurations, both on COCO 2017 `val2017` with the same frozen ViT-B/16 backbone.
+
+**Config A** — square 800×800 canvas, 200 queries, flat LR with `ReduceLROnPlateau`, no crop
+augmentation, auxiliary loss off, CIoU weight 2.0. Trained 50 epochs from scratch.
+
+**Config B** — what this repository is set up for today: aspect-ratio buckets, 100 queries,
+cosine LR decay, scale jitter + random crop, auxiliary loss at 0.4, CIoU weight 5.0. Resumed
+from config A's epoch-50 checkpoint and trained to **epoch 80 of a planned 100** — so these
+are a snapshot of a run in progress, not final numbers.
+
+### Training curves
+
+![Validation loss per epoch](docs/val_loss_curve.svg)
+
+The two segments are plotted **disconnected on purpose**. The config change bumped
+`LOSS_SEMANTICS_VERSION` 4 → 5, so the quantity on the y axis is not the same before and
+after epoch 50: 200 → 100 queries halves the background mass in the query-mean classification
+term, and the auxiliary and CIoU weights both moved. Joining them would draw a cliff that
+represents a redefinition rather than a regression.
+
+![Validation Recall@IoU0.5 per epoch](docs/recall_curve.svg)
+
+Recall **is** comparable across the boundary — it counts matched ground-truth boxes and does
+not depend on loss weights — so it is drawn as one line. The dip at epoch 51 is a real
+re-adaptation cost: new canvases and crop augmentation make the task genuinely harder, and it
+takes about 25 epochs to work back. At epoch 80 recall is 77.33% against config A's peak of
+77.83%, while average max IoU (0.6716) has already passed config A's best (0.6690).
+
+Per-epoch numbers are in [docs/training_history.csv](docs/training_history.csv); regenerate
+the charts with `python docs/plot_training_curves.py`.
+
+### COCO mAP
+
+`pycocotools` evaluation on the full 5k `val2017` split:
+
+| Metric | Config A @ ep50 | Config B @ ep80 | Δ |
+|---|---|---|---|
+| **AP @ IoU 0.50:0.95** | 0.398 | **0.425** | +0.027 |
+| AP @ IoU 0.50 | 0.637 | 0.653 | +0.016 |
+| AP @ IoU 0.75 | 0.414 | 0.446 | +0.032 |
+| AP small | 0.188 | 0.190 | +0.002 |
+| AP medium | 0.431 | 0.462 | +0.031 |
+| AP large | 0.616 | 0.656 | +0.040 |
+| AR @ 1 det | 0.332 | 0.347 | +0.015 |
+| AR @ 10 dets | 0.508 | 0.540 | +0.032 |
+| AR @ 100 dets | 0.529 | 0.563 | +0.034 |
+| AR small | 0.278 | 0.290 | +0.012 |
+| AR medium | 0.582 | 0.623 | +0.041 |
+| AR large | 0.773 | 0.833 | +0.060 |
+
+Three things worth reading carefully before taking these at face value.
+
+**AR@100 is partly an evaluation change, not a model change.** Config A discarded detections
+scoring below 0.05; config B keeps the top 100 by score regardless. Low-scoring boxes that
+used to be thrown away now count, which mechanically lifts recall at high detection budgets.
+The numbers that are *not* affected by this are AR@1 (the single highest-scoring box was
+always far above 0.05) and the AP75/AP50 ratio (a ratio cancels the change in detection
+volume). Both improved, so the model did genuinely get better — just don't quote the +0.034
+as the size of it.
+
+**The gain is concentrated at strict IoU.** AP75 rose 0.032 while AP50 rose only 0.016, taking
+the AP75/AP50 ratio from 0.650 to 0.683. That is the signature of aspect-ratio bucketing: no
+longer squashing a 4:3 photo to 1:1 does not help you *find* many more objects, but it makes
+the boxes you do find fit better.
+
+**Small objects barely moved**, +0.002 AP, despite scale jitter and random crop having been
+added specifically for them. AR(small) rose more (+0.012), so augmentation does make small
+objects get *found* more often — the model just cannot localise or score them well enough for
+it to become AP. The likely ceiling is patch resolution: with ViT-B/16 at 800px, a COCO
+"small" object (< 32² original pixels) often does not fill even one 16×16 patch, so the
+features simply are not there. The APs/APl ratio actually widened, 0.305 → 0.290. Multi-scale
+features are the fix, and they are not in this repository yet.
 
 ---
 
@@ -511,6 +591,15 @@ reset_best_metric.py         reset early-stopping bookkeeping in a checkpoint
 bench_dataloader.py          DataLoader throughput
 bench_gpu.py                 GPU throughput
 generate_png.py              architecture diagram
+```
+
+Plus the recorded run history behind [Results](#results):
+
+```
+docs/training_history.csv    per-epoch val loss / recall / avg max IoU / LR, epochs 1-80
+docs/plot_training_curves.py regenerates the two SVGs from that CSV
+docs/val_loss_curve.svg
+docs/recall_curve.svg
 ```
 
 After [Setup](#setup) your working directory additionally contains three untracked paths —
